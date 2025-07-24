@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
 import torch
 import numpy as np
-from datasets import load_dataset
+from datasets import load_from_disk, load_dataset, concatenate_datasets
 import os
 import glob
 import asyncio
@@ -146,6 +146,7 @@ def start_model_servers():
             # Check embedding server
             embed_resp = requests.get(embedding_url, timeout=1)
             embed_ready = embed_resp.status_code == 200
+            # embed_ready = True
             
             # Check reranker server
             # rerank_resp = requests.get(reranker_url, timeout=1)
@@ -181,6 +182,86 @@ def stop_model_servers():
         reranker_server_process = None
         
     logger.info("Model servers stopped")
+
+
+def get_max_passage_id(dataset):
+    """
+    Find the maximum passage_id in a dataset
+    
+    Args:
+        dataset: Dataset object with 'passage_id' (list) column
+        
+    Returns:
+        int: Maximum passage_id found
+    """
+    return max(dataset[-1]['passage_id'])
+
+
+def offset_dataset_passage_ids(dataset, offset):
+    """
+    Offset all passage_ids in a dataset by a given amount
+    
+    Args:
+        dataset: Dataset object with 'passage_id' (list) column
+        offset: Integer offset to add to all passage_ids
+        
+    Returns:
+        Dataset: New dataset with offset passage_ids
+    """
+    def offset_passage_ids(example):
+        example["passage_id"] = [pid + offset for pid in example["passage_id"]]
+        return example
+    
+    return dataset.map(offset_passage_ids, num_proc=16)
+
+
+def concat_datasets_with_passage_id_offset(datasets, dataset_names=None):
+    """
+    Concatenate multiple datasets while ensuring passage_ids don't overlap
+    
+    Args:
+        datasets: List of dataset objects
+        dataset_names: Optional list of names for logging
+        
+    Returns:
+        Dataset: Concatenated dataset with non-overlapping passage_ids
+    """
+    if not datasets:
+        raise ValueError("No datasets provided")
+    
+    if len(datasets) == 1:
+        return datasets[0]
+    
+    if dataset_names is None:
+        dataset_names = [f"Dataset {i+1}" for i in range(len(datasets))]
+    
+    # Start with the first dataset
+    combined_dataset = datasets[0]
+    current_max_passage_id = get_max_passage_id(datasets[0])
+    
+    logger.info(f"{dataset_names[0]} has {len(datasets[0])} records, max passage_id: {current_max_passage_id}")
+    
+    # Process remaining datasets with offsets
+    for i, dataset in enumerate(datasets[1:], 1):
+        dataset_name = dataset_names[i] if i < len(dataset_names) else f"Dataset {i+1}"
+        
+        # Calculate offset for this dataset
+        offset = current_max_passage_id + 1
+        original_max = get_max_passage_id(dataset)
+        
+        logger.info(f"{dataset_name} has {len(dataset)} records, original max passage_id: {original_max}")
+        logger.info(f"Offsetting {dataset_name} passage_ids by {offset}")
+        
+        # Apply offset and concatenate
+        offset_dataset = offset_dataset_passage_ids(dataset, offset)
+        combined_dataset = concatenate_datasets([combined_dataset, offset_dataset])
+        
+        # Update current max for next iteration
+        current_max_passage_id = original_max + offset
+        logger.info(f"After offset, {dataset_name} max passage_id: {current_max_passage_id}")
+    
+    logger.info(f"Combined dataset has {len(combined_dataset)} records")
+    return combined_dataset
 
 
 def get_embid2metadata_id(dataset):
@@ -263,19 +344,57 @@ async def startup_event():
         if not cache_loaded:
             logger.info("Loading data from source (cache not used)")
 
-        # Load metadata dataset (always needed for queries even when using cache)
+        # Load metadata datasets
         metadata_start_time = time.time()
+
+        from datasets import Features, Sequence, Value
+        target_features = Features({
+            'paper_url': Value('string'),
+            'paper_id': Value('string'), 
+            'paper_title': Value('string'),
+            'year': Value('float64'),
+            'venue': Value('string'),
+            'passage_text': Sequence(Value('string')),
+            # 'specialty': Sequence(Value('string')),
+            'passage_id': Sequence(Value('int64'))
+        })
+
         logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME}")
-        metadata_dataset = load_dataset(config.METADATA_DATASET_NAME, split="train")
+        metadata_dataset_1 = load_dataset(config.METADATA_DATASET_NAME, split="train")
+        metadata_dataset_1 = metadata_dataset_1.remove_columns(['specialty'])
+
+        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME_2}")
+        metadata_dataset_2 = load_dataset(config.METADATA_DATASET_NAME_2, split="train")
+        metadata_dataset_2 = metadata_dataset_2.remove_columns(['pid', 'specialty'])
+        metadata_dataset_2 = metadata_dataset_2.cast(target_features)
+
+        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME_3}")
+        metadata_dataset_3 = load_from_disk(config.METADATA_DATASET_NAME_3)
+        metadata_dataset_3 = metadata_dataset_3.remove_columns(['pid', 'specialty'])
+        metadata_dataset_3 = metadata_dataset_3.cast(target_features)
+
+        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME_4}")
+        metadata_dataset_4 = load_dataset(config.METADATA_DATASET_NAME_4, split="train")
+        metadata_dataset_4 = metadata_dataset_4.rename_column("pid", "paper_id")
+        metadata_dataset_4 = metadata_dataset_4.remove_columns(['specialty'])
+        metadata_dataset_4 = metadata_dataset_4.cast(target_features)
+        
+        # Concatenate datasets with automatic passage_id offset
+        datasets = [metadata_dataset_1, metadata_dataset_2, metadata_dataset_3, metadata_dataset_4]
+        dataset_names = ["Wiki Dataset", "FineWeb Dataset", "Semantic Scholar Dataset", "Arvix (TT+A) Dataset"]
+        metadata_dataset = concat_datasets_with_passage_id_offset(datasets, dataset_names)
+        
+        del metadata_dataset_1, metadata_dataset_2, metadata_dataset_3, metadata_dataset_4
         
         # Only create embedding ID mapping if not loaded from cache
         if not cache_loaded:
+            logger.info(f"Creating embedding ID to metadata ID mappings..")
             emb_id_to_metadata_id = get_embid2metadata_id(metadata_dataset)
         
         logger.info(f"Loaded {len(metadata_dataset)} metadata records")
+        logger.info(f"Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
         if DEBUG_MODE:
             logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
-            logger.info(f"DEBUG: Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
 
         # Initialize FAISS manager
         faiss_manager = FaissIndexManager(embedding_dimension=config.EMBEDDING_DIMENSION)
@@ -290,7 +409,9 @@ async def startup_event():
             use_cosine=config.FAISS_USE_COSINE,
             gpu_devices=config.FAISS_GPU_DEVICES,
             save_path=config.FAISS_INDEX_PATH,
-            load_path=config.FAISS_INDEX_PATH if os.path.exists(config.FAISS_INDEX_PATH) else None
+            load_path=config.FAISS_INDEX_PATH if os.path.exists(config.FAISS_INDEX_PATH) else None,
+            hnsw_m=config.FAISS_HNSW_M,
+            hnsw_efConstruction=config.FAISS_HNSW_EF_CONSTRUCTION
         )
         
         faiss_start_time = time.time()
@@ -724,10 +845,10 @@ async def search(request: SearchRequest):
         logger.info("Searching through embeddings...")
         
         num_candidates = (
-            config.MAX_SEARCH_RESULTS * 4
+            min(request.top_k, config.MAX_SEARCH_RESULTS) * 4
             if request.use_reranker
-            else int (config.MAX_SEARCH_RESULTS * 1.2 )
-        ) # Get more candidates if using reranker to account for deduplication
+            else int((min(request.top_k, config.MAX_SEARCH_RESULTS) * 1.2))
+        )  # Get more candidates if using reranker to account for deduplication
 
         search_start = time.time()
         # Use FAISS multi-GPU search

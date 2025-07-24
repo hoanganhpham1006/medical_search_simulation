@@ -32,14 +32,18 @@ class FaissIndexManager:
     def create_index(self, 
                      index_type: str = "IVFFlat", 
                      nlist: int = 1024,
-                     use_cosine: bool = True) -> faiss.Index:
+                     use_cosine: bool = True,
+                     hnsw_m: int = 32,
+                     hnsw_efConstruction: int = 200) -> faiss.Index:
         """
         Create a FAISS index based on configuration
         
         Args:
-            index_type: Type of index ("Flat", "IVFFlat", "IVFPQ")
+            index_type: Type of index ("Flat", "IVFFlat", "IVFPQ", "IVFHNSW")
             nlist: Number of clusters for IVF indexes
             use_cosine: Whether to use cosine similarity (L2 otherwise)
+            hnsw_m: Number of bi-directional links for HNSW (default: 32)
+            hnsw_efConstruction: Size of dynamic candidate list for HNSW construction (default: 200)
             
         Returns:
             FAISS index instance
@@ -59,6 +63,13 @@ class FaissIndexManager:
                 m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
                 nbits = 8  # bits per subvector
                 index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_INNER_PRODUCT)
+            elif index_type == "IVFHNSW":
+                # Create HNSW quantizer for fast cluster assignment
+                quantizer = faiss.IndexHNSWFlat(self.embedding_dimension, hnsw_m, faiss.METRIC_INNER_PRODUCT)
+                quantizer.hnsw.efConstruction = hnsw_efConstruction
+                # Create IVF index with HNSW quantizer
+                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_INNER_PRODUCT)
+                logger.info(f"Created IVFHNSW index with M={hnsw_m}, efConstruction={hnsw_efConstruction}, nlist={nlist}")
             else:
                 raise ValueError(f"Unsupported index type: {index_type}")
         else:
@@ -74,11 +85,38 @@ class FaissIndexManager:
                 m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
                 nbits = 8  # bits per subvector
                 index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_L2)
+            elif index_type == "IVFHNSW":
+                # Create HNSW quantizer for fast cluster assignment
+                quantizer = faiss.IndexHNSWFlat(self.embedding_dimension, hnsw_m, faiss.METRIC_L2)
+                quantizer.hnsw.efConstruction = hnsw_efConstruction
+                # Create IVF index with HNSW quantizer
+                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_L2)
+                logger.info(f"Created IVFHNSW index with M={hnsw_m}, efConstruction={hnsw_efConstruction}, nlist={nlist}")
             else:
                 raise ValueError(f"Unsupported index type: {index_type}")
         
         logger.info(f"Created {index_type} index: {index}")
         return index
+    
+    def create_index_factory(self, factory_string: str) -> faiss.Index:
+        """
+        Create a FAISS index using factory string notation
+        
+        Args:
+            factory_string: FAISS factory string (e.g., "IVF1024(HNSW32),Flat", "IVF1024,PQ32", "HNSW32")
+            
+        Returns:
+            FAISS index instance
+        """
+        logger.info(f"Creating FAISS index using factory string: {factory_string}")
+        
+        try:
+            index = faiss.index_factory(self.embedding_dimension, factory_string)
+            logger.info(f"Created factory index: {type(index).__name__}")
+            return index
+        except Exception as e:
+            logger.error(f"Failed to create index with factory string '{factory_string}': {e}")
+            raise
     
     def load_embeddings_from_files(self, 
                                    embedding_folder: str, 
@@ -159,7 +197,9 @@ class FaissIndexManager:
                              index_type: str = "IVFFlat",
                              nlist: int = 1024,
                              use_cosine: bool = True,
-                             training_sample_size: Optional[int] = None) -> faiss.Index:
+                             training_sample_size: Optional[int] = None,
+                             hnsw_m: int = 32,
+                             hnsw_efConstruction: int = 200) -> faiss.Index:
         """
         Build and train a FAISS index with the given embeddings
         
@@ -169,6 +209,8 @@ class FaissIndexManager:
             nlist: Number of clusters for IVF indexes
             use_cosine: Whether to use cosine similarity
             training_sample_size: Number of vectors to use for training (None = use all)
+            hnsw_m: Number of bi-directional links for HNSW (default: 32)
+            hnsw_efConstruction: Size of dynamic candidate list for HNSW construction (default: 200)
             
         Returns:
             Trained FAISS index
@@ -177,7 +219,7 @@ class FaissIndexManager:
         start_time = time.time()
         
         # Create the index
-        index = self.create_index(index_type, nlist, use_cosine)
+        index = self.create_index(index_type, nlist, use_cosine, hnsw_m, hnsw_efConstruction)
         
         # Train the index if needed (IVF-based indexes need training)
         if hasattr(index, 'train') and not index.is_trained:
@@ -209,7 +251,9 @@ class FaissIndexManager:
                                nlist: int = 1024,
                                use_cosine: bool = True,
                                batch_size: int = 50,
-                               training_samples_per_file: int = 256) -> faiss.Index:
+                               training_samples_per_file: int = 512,
+                               hnsw_m: int = 32,
+                               hnsw_efConstruction: int = 200) -> faiss.Index:
         """
         Build FAISS index incrementally by loading embeddings in batches
         This avoids loading all embeddings into memory at once
@@ -222,6 +266,8 @@ class FaissIndexManager:
             use_cosine: Whether to use cosine similarity
             batch_size: Number of files to process at once
             training_samples_per_file: Number of samples to collect per file for training
+            hnsw_m: Number of bi-directional links for HNSW (default: 32)
+            hnsw_efConstruction: Size of dynamic candidate list for HNSW construction (default: 200)
             
         Returns:
             Trained FAISS index
@@ -230,16 +276,18 @@ class FaissIndexManager:
         start_time = time.time()
         
         # Create the index
-        index = self.create_index(index_type, nlist, use_cosine)
+        index = self.create_index(index_type, nlist, use_cosine, hnsw_m, hnsw_efConstruction)
         
         # For IVF indexes, we need to train first
-        if index_type in ["IVFFlat", "IVFPQ"]:
+        if index_type in ["IVFFlat", "IVFPQ", "IVFHNSW"]:
             logger.info("Collecting training samples...")
             training_data = []
             
             # Collect training samples from a subset of files
-            num_training_files = min(1000, max_files)  # Use first 1000 files for training
-            for i in range(0, num_training_files, 3):  # Sample every 3rd file
+            # Need ~10M training points for 262k clusters. With 512 samples per file, need ~20k files
+            num_training_files = min(max_files, max_files)  # Use all available files for training
+            step = max(1, max_files // 20000)  # Sample enough files to get 20k files total
+            for i in range(0, num_training_files, step):
                 file_path = os.path.join(embedding_folder, f"embeddings_{i}.pt")
                 try:
                     embeddings = torch.load(file_path, map_location="cpu")
@@ -334,6 +382,29 @@ class FaissIndexManager:
         
         return index
     
+    def _is_gpu_compatible(self, index: faiss.Index) -> bool:
+        """
+        Check if an index is compatible with GPU
+        
+        Args:
+            index: FAISS index to check
+            
+        Returns:
+            bool: True if GPU compatible, False otherwise
+        """
+        # Check if index contains HNSW
+        index_str = str(type(index).__name__)
+        if "HNSW" in index_str or hasattr(index, 'hnsw'):
+            return False
+            
+        # Check if the index has an HNSW quantizer (for IVFHNSW)
+        if hasattr(index, 'quantizer'):
+            quantizer_str = str(type(index.quantizer).__name__)
+            if "HNSW" in quantizer_str:
+                return False
+        
+        return True
+    
     def setup_multi_gpu_index(self, 
                              cpu_index: faiss.Index,
                              gpu_devices: Optional[List[int]] = None) -> faiss.Index:
@@ -345,8 +416,24 @@ class FaissIndexManager:
             gpu_devices: List of GPU device IDs to use (None = use all available)
             
         Returns:
-            Multi-GPU index
+            Multi-GPU index (or CPU index if GPU not supported)
         """
+        # Check if index contains HNSW
+        index_str = str(type(cpu_index).__name__)
+        logger.info(f"Index type: {index_str}")
+        
+        if "HNSW" in index_str or hasattr(cpu_index, 'hnsw'):
+            logger.info("HNSW indexes are not supported on GPU, using CPU index")
+            return cpu_index
+            
+        # Check if the index has an HNSW quantizer (for IVFHNSW)
+        if hasattr(cpu_index, 'quantizer'):
+            quantizer_str = str(type(cpu_index.quantizer).__name__)
+            logger.info(f"Quantizer type: {quantizer_str}")
+            if "HNSW" in quantizer_str:
+                logger.info("Index with HNSW quantizer is not supported on GPU, using CPU index")
+                return cpu_index
+        
         if self.num_gpus == 0:
             logger.warning("No GPUs available, returning CPU index")
             return cpu_index
@@ -431,8 +518,12 @@ class FaissIndexManager:
         Returns:
             Tuple of (distances, indices)
         """
-        if self.gpu_index is None:
+        # Check if we have an index (either GPU or CPU)
+        if self.gpu_index is None and self.cpu_index is None:
             raise ValueError("No index loaded. Call setup_index first.")
+        
+        # Use GPU index if available, otherwise use CPU index
+        search_index = self.gpu_index if self.gpu_index is not None else self.cpu_index
         
         # Convert to numpy if needed
         if isinstance(query_embeddings, torch.Tensor):
@@ -452,7 +543,7 @@ class FaissIndexManager:
         
         # Perform search
         with self.index_lock:
-            distances, indices = self.gpu_index.search(query_embeddings, k)
+            distances, indices = search_index.search(query_embeddings, k)
         
         return distances, indices
     
@@ -464,7 +555,9 @@ class FaissIndexManager:
                                use_cosine: bool = True,
                                gpu_devices: Optional[List[int]] = None,
                                save_path: Optional[str] = None,
-                               load_path: Optional[str] = None) -> None:
+                               load_path: Optional[str] = None,
+                               hnsw_m: int = 32,
+                               hnsw_efConstruction: int = 200) -> None:
         """
         Setup index incrementally from embedding files
         
@@ -477,6 +570,8 @@ class FaissIndexManager:
             gpu_devices: GPU devices to use
             save_path: Path to save the built index
             load_path: Path to load existing index (skips building)
+            hnsw_m: Number of bi-directional links for HNSW (default: 32)
+            hnsw_efConstruction: Size of dynamic candidate list for HNSW construction (default: 200)
         """
         logger.info("Starting incremental FAISS index setup...")
         
@@ -491,17 +586,28 @@ class FaissIndexManager:
                 max_files=max_files,
                 index_type=index_type,
                 nlist=nlist,
-                use_cosine=use_cosine
+                use_cosine=use_cosine,
+                hnsw_m=hnsw_m,
+                hnsw_efConstruction=hnsw_efConstruction
             )
             
             # Save index if requested
             if save_path:
                 self.save_index(self.cpu_index, save_path)
         
-        # Setup multi-GPU index
+        # Setup multi-GPU index if supported
         if gpu_devices is not None and len(gpu_devices) > 0:
-            self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
-            logger.info("Multi-GPU index setup completed")
+            # Also check the original index_type parameter for HNSW
+            is_hnsw_config = "HNSW" in index_type
+            if self._is_gpu_compatible(self.cpu_index) and not is_hnsw_config:
+                self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
+                logger.info("Multi-GPU index setup completed")
+            else:
+                if is_hnsw_config:
+                    logger.info("HNSW index type from config - not compatible with GPU, using CPU index")
+                else:
+                    logger.info("Index type not compatible with GPU, using CPU index")
+                self.gpu_index = self.cpu_index
     
     def setup_index_from_embeddings(self,
                                    embeddings: np.ndarray,
@@ -553,11 +659,15 @@ class FaissIndexManager:
             if save_path:
                 self.save_index(self.cpu_index, save_path)
         
-        # Setup multi-GPU index
-        self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
-        
-        logger.info("FAISS index setup completed successfully!")
-        logger.info(f"Index ready with {self.gpu_index.ntotal} vectors on {self.num_gpus} GPUs")
+        # Setup multi-GPU index if supported
+        if gpu_devices is not None and len(gpu_devices) > 0 and self._is_gpu_compatible(self.cpu_index):
+            self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
+            logger.info("FAISS index setup completed successfully!")
+            logger.info(f"Index ready with {self.gpu_index.ntotal} vectors on {self.num_gpus} GPUs")
+        else:
+            self.gpu_index = self.cpu_index
+            logger.info("FAISS index setup completed successfully!")
+            logger.info(f"Index ready with {self.cpu_index.ntotal} vectors (CPU mode)")
 
     def setup_index(self,
                    embedding_folder: str,
@@ -609,11 +719,15 @@ class FaissIndexManager:
             if save_path:
                 self.save_index(self.cpu_index, save_path)
         
-        # Setup multi-GPU index
-        self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
-        
-        logger.info("FAISS index setup completed successfully!")
-        logger.info(f"Index ready with {self.gpu_index.ntotal} vectors on {self.num_gpus} GPUs")
+        # Setup multi-GPU index if supported
+        if gpu_devices is not None and len(gpu_devices) > 0 and self._is_gpu_compatible(self.cpu_index):
+            self.gpu_index = self.setup_multi_gpu_index(self.cpu_index, gpu_devices)
+            logger.info("FAISS index setup completed successfully!")
+            logger.info(f"Index ready with {self.gpu_index.ntotal} vectors on {self.num_gpus} GPUs")
+        else:
+            self.gpu_index = self.cpu_index
+            logger.info("FAISS index setup completed successfully!")
+            logger.info(f"Index ready with {self.cpu_index.ntotal} vectors (CPU mode)")
     
     def get_stats(self) -> dict:
         """Get index statistics"""

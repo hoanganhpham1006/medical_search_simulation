@@ -54,7 +54,9 @@ class StartupDataCache:
             'MAX_EMBEDDING_FILES': config.MAX_EMBEDDING_FILES,
             'METADATA_DATASET_NAME': config.METADATA_DATASET_NAME,
             'EMBEDDING_DIMENSION': config.EMBEDDING_DIMENSION,
-            'DEBUG_MODE': config.DEBUG_MODE
+            'FAISS_INDEX_TYPE': config.FAISS_INDEX_TYPE,
+            'FAISS_NLIST': config.FAISS_NLIST,
+            'DEBUG_MODE': True
         }
         config_str = json.dumps(config_params, sort_keys=True)
         return hashlib.md5(config_str.encode()).hexdigest()

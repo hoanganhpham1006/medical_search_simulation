@@ -147,21 +147,22 @@ def get_openai_response(passage_texts):
 
 def main():
     # Read the CSV file
-    dataset = load_dataset("hoanganhpham/eai_taxonomy_med_part_5", split="train")
+    dataset = load_dataset("hoanganhpham/eai_taxonomy_med_part_3", split="train")
     # dataset = dataset.select(range(65752, 65760)) # DEBUG
     # df = pd.DataFrame(dataset)
     # Shuffle the dataframe
     # df = df.sample(frac=1).reset_index(drop=True)
     print(f"Total rows: {len(dataset)}")
     batch_size = 8192
-    for j in range(821064, len(dataset), batch_size):
+    # for j in range(272 * 8096, len(dataset), batch_size):
+    for j in range(len(dataset) - batch_size, 0, -batch_size):
         print(f"Processing from row {j}")
         _df = pd.DataFrame(dataset.select(range(j, j + batch_size)))
         del _df['paper_title']
         _df["paper_title"] = _df['passage_text'].parallel_apply(lambda x: get_openai_response(x))
         _df = _df[["paper_title"]]
         try:
-            filename = f"/mnt/sharefs/tuenv/eai/title_outputs_5/output_{j // batch_size}.parquet"
+            filename = f"/mnt/sharefs/tuenv/eai/title_outputs_3/output_{j // batch_size}.parquet"
             _df.to_parquet(filename, index=False)
         except Exception as e:
             print(f"Error while saving parquet: {e}")
