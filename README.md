@@ -94,6 +94,8 @@ cd faiss
 
 # Install SWIG (required for Python bindings)
 conda install -c conda-forge swig gflags
+# Install CMake
+conda install -c conda-forge cmake==4.0.3
 
 # Configure and build FAISS with GPU support
 cmake -B build -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="89" .
