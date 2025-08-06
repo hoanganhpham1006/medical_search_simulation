@@ -228,8 +228,8 @@ class StartupDataCache:
         
         for name, file_path in [
             ('emb_id_mapping', self.emb_id_mapping_file),
-            ('quantized_embeddings', self.quantized_embeddings_file),
-            ('quantization_metadata', self.quantization_metadata_file),
+            # ('quantized_embeddings', self.quantized_embeddings_file),
+            # ('quantization_metadata', self.quantization_metadata_file),
             ('url_content_cache', self.url_content_cache_file),
             ('cache_info', self.cache_info_file)
         ]:

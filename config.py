@@ -5,9 +5,15 @@ Configuration file for Medical Search Simulation API
 import os
 
 # Model Configuration
-EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-8B"
+EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-4B"
 RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-8B"
-METADATA_DATASET_NAME = "hoanganhpham/Wiki_metadata"
+METADATA_DATASET_NAME = "/vast/llm/andy/search-r1/Wiki_Metadata_4096_chunks/data0"
+# File Paths
+FAISS_INDEX_PATH = "/vast/llm/andy/search-r1/faiss_index.bin"  # Path to save/load FAISS index
+EMBEDDING_FOLDER = "/vast/llm/andy/search-r1/Wiki_Metadata_4096_chunks_embs"
+CACHE_DIR = "/vast/llm/andy/search-r1/cache"  # Directory for cache files
+# HF_HOME = os.getenv("HF_HOME", "/vast/llm/share/")
+# TRANSFORMERS_CACHE = os.getenv("TRANSFORMERS_CACHE", "/vast/llm/share/")
 
 # VLLM Configuration
 TRUST_REMOTE_CODE = True
@@ -21,18 +27,17 @@ API_VERSION = "1.0.0"
 # Search Configuration
 MAX_SEARCH_RESULTS = 20
 TOP_K_RERANK = 10
-EMBEDDING_DIMENSION = 4096  # Adjust based on actual model dimension
+EMBEDDING_DIMENSION = 512  # Adjust based on actual model dimension
 BATCH_SIZE = 65536  # Batch size for GPU processing during search
 USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
 PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 MINIMUM_PREVIEW_CHAR = 256  # Minimum preview character length
 
 # FAISS Configuration
-FAISS_INDEX_TYPE = "IVFPQ"  # Options: "Flat", "IVFFlat", "IVFPQ" (IVFPQ provides built-in quantization)
+FAISS_INDEX_TYPE = "Flat"  # Options: "Flat", "IVFFlat", "IVFPQ" (IVFPQ provides built-in quantization)
 FAISS_NLIST = 1024  # Number of clusters for IVF indexes
 FAISS_USE_COSINE = True  # Use cosine similarity (normalized vectors with IP)
 FAISS_GPU_DEVICES = [0, 1, 2, 3, 4, 5, 6, 7]  # GPU devices for FAISS
-FAISS_INDEX_PATH = "/mnt/sharefs/tuenv/wiki_search_cache/faiss_index.bin"  # Path to save/load FAISS index
 FAISS_SEARCH_K = 1000  # Initial k for FAISS search before reranking
 
 # Note: Quantization is now handled by FAISS internally (IVFPQ index type)
@@ -41,11 +46,9 @@ FAISS_SEARCH_K = 1000  # Initial k for FAISS search before reranking
 MAX_LOGPROBS = 8192  # Maximum number of log probabilities to return
 RERANK_BATCH_SIZE = 32  # Batch size for reranking
 
-# File Paths
-EMBEDDING_FOLDER = "/mnt/sharefs/tuenv/wiki_embeddings/"
 # MAX_EMBEDDING_FILES = 3205  # Define correctly number of emb files
 # 0 -> 281: Miriad, 282 -> 3204: Pubmed, 3205 ->: Taxonomy
-MAX_EMBEDDING_FILES = 785
+MAX_EMBEDDING_FILES = 80
 # 0 -> 785: Wiki EN
 # Logging Configuration
 LOG_LEVEL = "INFO"
@@ -54,8 +57,6 @@ DEBUG_MODE = False  # Set to True to enable detailed debug logging
 
 # Environment Variables (with defaults)
 CUDA_VISIBLE_DEVICES = os.getenv("CUDA_VISIBLE_DEVICES", "0")
-HF_HOME = os.getenv("HF_HOME", "/tmp/huggingface")
-TRANSFORMERS_CACHE = os.getenv("TRANSFORMERS_CACHE", "/tmp/transformers")
 
 # Model Loading Timeout (seconds)
 MODEL_LOADING_TIMEOUT = 600  # 10 minutes
@@ -78,7 +79,7 @@ RERANK_GPU_DEVICES = "1,2,3,4,5,6,7"  # GPU device(s) for reranker server
 # Model server specific configurations
 EMBEDDING_TENSOR_PARALLEL_SIZE = 8
 EMBEDDING_DATA_PARALLEL_SIZE = 1
-EMBEDDING_GPU_MEMORY_UTILIZATION = 0.9
+EMBEDDING_GPU_MEMORY_UTILIZATION = 0.1
 MAX_MODEL_LEN = 4096  # Maximum sequence length
 
 RERANK_TENSOR_PARALLEL_SIZE = 1
@@ -90,5 +91,4 @@ RERANK_MAX_DOC_CHAR = 30000 # Roughly cut-off at 30k characters per document
 
 # Cache Configuration
 USE_STARTUP_CACHE = True  # Enable caching of startup data
-CACHE_DIR = "/mnt/sharefs/tuenv/wiki_search_cache"  # Directory for cache files
 FORCE_CACHE_REBUILD = False  # Force rebuilding cache even if valid

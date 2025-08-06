@@ -14,7 +14,23 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import config
 
+
 logger = logging.getLogger(__name__)
+
+
+def load_embedding_file(file_path: str, truncate_dim: Optional[int] = None) -> Optional[torch.Tensor]:
+    """Load a single embedding file"""
+    try:
+        embeddings = torch.load(file_path, map_location="cpu")
+        if embeddings.dim() == 1:
+            embeddings = embeddings.unsqueeze(0)
+        if truncate_dim is not None:
+            embeddings = embeddings[:, :truncate_dim]
+        return embeddings
+    except Exception as e:
+        logger.warning(f"Failed to load {file_path}: {e}")
+        return None
+
 
 class FaissIndexManager:
     """
@@ -44,113 +60,54 @@ class FaissIndexManager:
         Returns:
             FAISS index instance
         """
+        assert index_type in ["Flat", "IVFFlat", "IVFPQ"], f"Unsupported index type: {index_type}"
+        metric = faiss.METRIC_INNER_PRODUCT if use_cosine else faiss.METRIC_L2
         logger.info(f"Creating FAISS {index_type} index with dimension {self.embedding_dimension}")
-        
-        if use_cosine:
-            # For cosine similarity, we'll normalize vectors and use IP (Inner Product)
-            if index_type == "Flat":
-                index = faiss.IndexFlatIP(self.embedding_dimension)
-            elif index_type == "IVFFlat":
-                quantizer = faiss.IndexFlatIP(self.embedding_dimension)
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_INNER_PRODUCT)
-            elif index_type == "IVFPQ":
-                quantizer = faiss.IndexFlatIP(self.embedding_dimension)
-                # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
-                m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
-                nbits = 8  # bits per subvector
-                index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_INNER_PRODUCT)
-            else:
-                raise ValueError(f"Unsupported index type: {index_type}")
-        else:
-            # L2 distance
-            if index_type == "Flat":
-                index = faiss.IndexFlatL2(self.embedding_dimension)
-            elif index_type == "IVFFlat":
-                quantizer = faiss.IndexFlatL2(self.embedding_dimension)
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_L2)
-            elif index_type == "IVFPQ":
-                quantizer = faiss.IndexFlatL2(self.embedding_dimension)
-                # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
-                m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
-                nbits = 8  # bits per subvector
-                index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_L2)
-            else:
-                raise ValueError(f"Unsupported index type: {index_type}")
-        
+
+        if index_type == "Flat":
+            index = faiss.IndexFlatIP(self.embedding_dimension)
+        elif index_type == "IVFFlat":
+            quantizer = faiss.IndexFlatIP(self.embedding_dimension)
+            index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, metric)
+        elif index_type == "IVFPQ":
+            quantizer = faiss.IndexFlatIP(self.embedding_dimension)
+            # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
+            m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
+            nbits = 8  # bits per subvector
+            index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, metric)
+
         logger.info(f"Created {index_type} index: {index}")
         return index
     
     def load_embeddings_from_files(self, 
-                                   embedding_folder: str, 
-                                   max_files: int = 3205,
-                                   batch_size: int = 50,
+                                   files: List[str],
                                    normalize: bool = True) -> np.ndarray:
         """
         Load embeddings from .pt files and return as numpy array
         
         Args:
-            embedding_folder: Path to folder containing embedding files
-            max_files: Maximum number of files to load
-            batch_size: Number of files to process in parallel
+            files: List of embedding file paths
             normalize: Whether to normalize embeddings for cosine similarity
             
         Returns:
             Normalized embeddings as numpy array
         """
-        logger.info(f"Loading embeddings from {embedding_folder}")
         start_time = time.time()
-        
-        def load_embedding_file(file_idx: int) -> Tuple[int, Optional[torch.Tensor]]:
-            """Load a single embedding file"""
-            file_path = os.path.join(embedding_folder, f"embeddings_{file_idx}.pt")
-            try:
-                embeddings = torch.load(file_path, map_location="cpu")
-                if embeddings.dim() == 1:
-                    embeddings = embeddings.unsqueeze(0)
-                return file_idx, embeddings
-            except Exception as e:
-                logger.warning(f"Failed to load {file_path}: {e}")
-                return file_idx, None
-        
-        # Load embeddings in parallel batches
-        all_embeddings = []
-        
-        for batch_start in range(0, max_files, batch_size):
-            batch_end = min(batch_start + batch_size, max_files)
-            logger.info(f"Loading embedding batch {batch_start}-{batch_end-1}")
-            
-            with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
-                futures = {executor.submit(load_embedding_file, i): i 
-                          for i in range(batch_start, batch_end)}
-                
-                batch_embeddings = [None] * (batch_end - batch_start)
-                for future in futures:
-                    file_idx, embeddings = future.result()
-                    if embeddings is not None:
-                        batch_embeddings[file_idx - batch_start] = embeddings
-                
-                # Add non-None embeddings to collection
-                for embeddings in batch_embeddings:
-                    if isinstance(embeddings, torch.Tensor):
-                        if embeddings.dim() == 2:
-                            all_embeddings.extend(embeddings)
-                        else:
-                            all_embeddings.append(embeddings)
+
+        with ThreadPoolExecutor(max_workers=min(len(files), 32, os.cpu_count() * 2)) as executor:
+            futures = [executor.submit(load_embedding_file, file_path, self.embedding_dimension) for file_path in files]
+            all_embeddings = [future.result() for future in futures]
+            all_embeddings = [embeddings for embeddings in all_embeddings if embeddings is not None]
         
         if not all_embeddings:
             raise ValueError("No embeddings were loaded successfully")
         
-        # Convert to numpy and stack
-        logger.info("Converting embeddings to numpy array...")
-        embeddings_matrix = torch.vstack(all_embeddings).numpy().astype(np.float32)
+        embeddings_matrix = torch.vstack(all_embeddings).to(dtype=torch.float32)
         
-        # Normalize for cosine similarity if requested
         if normalize:
-            logger.info("Normalizing embeddings for cosine similarity...")
-            norms = np.linalg.norm(embeddings_matrix, axis=1, keepdims=True)
-            norms[norms == 0] = 1  # Avoid division by zero
-            embeddings_matrix = embeddings_matrix / norms
+            embeddings_matrix = torch.nn.functional.normalize(embeddings_matrix, dim=1)
         
+        embeddings_matrix = embeddings_matrix.numpy()
         logger.info(f"Loaded embeddings matrix: {embeddings_matrix.shape} in {time.time() - start_time:.2f}s")
         return embeddings_matrix
     
@@ -235,99 +192,61 @@ class FaissIndexManager:
         # For IVF indexes, we need to train first
         if index_type in ["IVFFlat", "IVFPQ"]:
             logger.info("Collecting training samples...")
-            training_data = []
             
-            # Collect training samples from a subset of files
-            num_training_files = min(1000, max_files)  # Use first 1000 files for training
-            for i in range(0, num_training_files, 3):  # Sample every 3rd file
+            # Collect training files (every 3rd file from first 1000)
+            num_training_files = min(1000, max_files)
+            training_files = []
+            for i in range(0, num_training_files, 3):
                 file_path = os.path.join(embedding_folder, f"embeddings_{i}.pt")
+                if os.path.exists(file_path):
+                    training_files.append(file_path)
+            
+            if training_files:
                 try:
-                    embeddings = torch.load(file_path, map_location="cpu")
-                    if embeddings.dim() == 1:
-                        embeddings = embeddings.unsqueeze(0)
+                    # Load all training embeddings using existing method
+                    training_data = self.load_embeddings_from_files(
+                        files=training_files, 
+                        normalize=use_cosine
+                    )
                     
-                    # Convert to numpy
-                    embeddings_np = embeddings.numpy().astype(np.float32)
+                    # Sample training vectors if we have too many
+                    max_training_samples = training_samples_per_file * len(training_files)
+                    if len(training_data) > max_training_samples:
+                        indices = np.random.choice(len(training_data), max_training_samples, replace=False)
+                        training_data = training_data[indices]
                     
-                    # Normalize if using cosine
-                    if use_cosine:
-                        norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
-                        norms[norms == 0] = 1
-                        embeddings_np = embeddings_np / norms
+                    logger.info(f"Training index with {len(training_data)} samples...")
+                    index.train(training_data)
+                    logger.info("Index training completed")
                     
-                    # Sample some vectors for training
-                    n_samples = min(training_samples_per_file, len(embeddings_np))
-                    if len(embeddings_np) > n_samples:
-                        indices = np.random.choice(len(embeddings_np), n_samples, replace=False)
-                        training_data.append(embeddings_np[indices])
-                    else:
-                        training_data.append(embeddings_np)
+                    # Clear training data to free memory
+                    del training_data
                     
                 except Exception as e:
-                    logger.warning(f"Failed to load training samples from {file_path}: {e}")
-            
-            if training_data:
-                training_data = np.vstack(training_data)
-                logger.info(f"Training index with {len(training_data)} samples...")
-                index.train(training_data)
-                logger.info("Index training completed")
-                # Clear training data to free memory
-                del training_data
+                    logger.warning(f"Failed to load training data: {e}")
+                    logger.warning("Index may not perform well without training")
             else:
                 logger.warning("No training data collected, index may not perform well")
         
         # Load and add embeddings in batches
         logger.info("Adding embeddings to index in batches...")
         total_added = 0
-        
-        def load_and_process_file(file_idx: int) -> Tuple[int, Optional[np.ndarray]]:
-            """Load a single embedding file and convert to numpy"""
-            file_path = os.path.join(embedding_folder, f"embeddings_{file_idx}.pt")
-            try:
-                embeddings = torch.load(file_path, map_location="cpu")
-                if embeddings.dim() == 1:
-                    embeddings = embeddings.unsqueeze(0)
                 
-                # Convert to numpy
-                embeddings_np = embeddings.numpy().astype(np.float32)
-                
-                # Normalize if using cosine
-                if use_cosine:
-                    norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
-                    norms[norms == 0] = 1
-                    embeddings_np = embeddings_np / norms
-                
-                return file_idx, embeddings_np
-            except Exception as e:
-                logger.warning(f"Failed to load {file_path}: {e}")
-                return file_idx, None
-        
         # Process files in batches
         for batch_start in range(0, max_files, batch_size):
             batch_end = min(batch_start + batch_size, max_files)
             logger.info(f"Processing embedding batch {batch_start}-{batch_end-1}")
             
-            # Load files in parallel
-            batch_embeddings = []
-            with ThreadPoolExecutor(max_workers=min(16, os.cpu_count())) as executor:
-                futures = [executor.submit(load_and_process_file, i) 
-                          for i in range(batch_start, batch_end)]
-                
-                for future in futures:
-                    file_idx, embeddings_np = future.result()
-                    if embeddings_np is not None:
-                        batch_embeddings.append(embeddings_np)
+            batch_files = [os.path.join(embedding_folder, f"embeddings_{i}.pt") for i in range(batch_start, batch_end)]
+            batch_embeddings = self.load_embeddings_from_files(batch_files)
             
             # Add batch to index
-            if batch_embeddings:
-                batch_matrix = np.vstack(batch_embeddings)
-                index.add(batch_matrix)
-                total_added += len(batch_matrix)
-                logger.info(f"Added {len(batch_matrix)} vectors (total: {total_added})")
+            index.add(batch_embeddings)
+            total_added += len(batch_embeddings)
+            logger.info(f"Added {len(batch_embeddings)} vectors (total: {total_added})")
                 
-                # Clear batch to free memory
-                del batch_embeddings
-                del batch_matrix
+            # Clear batch to free memory
+            del batch_embeddings
         
         logger.info(f"Incremental index build completed in {time.time() - start_time:.2f}s")
         logger.info(f"Index statistics: {index.ntotal} vectors")

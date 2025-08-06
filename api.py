@@ -733,7 +733,7 @@ async def search(request: SearchRequest):
         # Use FAISS multi-GPU search
         logger.info("Using FAISS multi-GPU search...")
         distances, indices = faiss_manager.search(
-            query_embedding,
+            query_embedding[:config.EMBEDDING_DIMENSION],
             k=min(num_candidates, config.FAISS_SEARCH_K),
             normalize_query=config.FAISS_USE_COSINE
         )
@@ -1009,4 +1009,4 @@ if __name__ == "__main__":
     if hasattr(args, 'reranking_port') and args.reranking_port != config.RERANKER_SERVER_PORT:
         config.RERANKER_SERVER_PORT = args.reranking_port
     
-    uvicorn.run(app, host=args.host, port=args.port)
+    uvicorn.run("api:app", host=args.host, port=args.port, reload=True)
