@@ -7,7 +7,7 @@ import os
 # Model Configuration
 EMBEDDING_MODEL_NAME = "Qwen/Qwen3-Embedding-4B"
 RERANKER_MODEL_NAME = "Qwen/Qwen3-Reranker-8B"
-METADATA_DATASET_NAME = "/vast/llm/andy/search-r1/Wiki_Metadata_4096_chunks/data0"
+METADATA_DATASET_NAME = "/vast/llm/andy/search-r1/Wiki_Metadata_4096_chunks/data"
 # File Paths
 FAISS_INDEX_PATH = "/vast/llm/andy/search-r1/faiss_index.bin"  # Path to save/load FAISS index
 EMBEDDING_FOLDER = "/vast/llm/andy/search-r1/Wiki_Metadata_4096_chunks_embs"
@@ -27,14 +27,14 @@ API_VERSION = "1.0.0"
 # Search Configuration
 MAX_SEARCH_RESULTS = 20
 TOP_K_RERANK = 10
-EMBEDDING_DIMENSION = 512  # Adjust based on actual model dimension
+EMBEDDING_DIMENSION = 2560  # Adjust based on actual model dimension
 BATCH_SIZE = 65536  # Batch size for GPU processing during search
 USE_GPU_PRELOADING = True  # Enable GPU preloading for better pipeline efficiency
 PRELOAD_BUFFER_SIZE = 2  # Number of batches to keep in GPU buffer
 MINIMUM_PREVIEW_CHAR = 256  # Minimum preview character length
 
 # FAISS Configuration
-FAISS_INDEX_TYPE = "Flat"  # Options: "Flat", "IVFFlat", "IVFPQ" (IVFPQ provides built-in quantization)
+FAISS_INDEX_TYPE = "IVFPQ"  # Options: "Flat", "IVFFlat", "IVFPQ" (IVFPQ provides built-in quantization)
 FAISS_NLIST = 1024  # Number of clusters for IVF indexes
 FAISS_USE_COSINE = True  # Use cosine similarity (normalized vectors with IP)
 FAISS_GPU_DEVICES = [0, 1, 2, 3, 4, 5, 6, 7]  # GPU devices for FAISS
@@ -48,7 +48,7 @@ RERANK_BATCH_SIZE = 32  # Batch size for reranking
 
 # MAX_EMBEDDING_FILES = 3205  # Define correctly number of emb files
 # 0 -> 281: Miriad, 282 -> 3204: Pubmed, 3205 ->: Taxonomy
-MAX_EMBEDDING_FILES = 80
+MAX_EMBEDDING_FILES = 3129
 # 0 -> 785: Wiki EN
 # Logging Configuration
 LOG_LEVEL = "INFO"
