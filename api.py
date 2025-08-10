@@ -1009,4 +1009,4 @@ if __name__ == "__main__":
     if hasattr(args, 'reranking_port') and args.reranking_port != config.RERANKER_SERVER_PORT:
         config.RERANKER_SERVER_PORT = args.reranking_port
     
-    uvicorn.run("api:app", host=args.host, port=args.port, reload=True)
+    uvicorn.run("api:app", host=args.host, port=args.port)
