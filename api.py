@@ -717,6 +717,7 @@ async def search(request: SearchRequest):
         # Get query embedding
         embed_start = time.time()
         query_embedding = await get_query_embedding(query)
+        query_embedding = query_embedding[:config.EMBEDDING_DIMENSION]
         if DEBUG_MODE:
             logger.info(f"DEBUG: Query embedding obtained in {time.time() - embed_start:.3f} seconds")
 
@@ -733,7 +734,7 @@ async def search(request: SearchRequest):
         # Use FAISS multi-GPU search
         logger.info("Using FAISS multi-GPU search...")
         distances, indices = faiss_manager.search(
-            query_embedding[:config.EMBEDDING_DIMENSION],
+            query_embedding,
             k=min(num_candidates, config.FAISS_SEARCH_K),
             normalize_query=config.FAISS_USE_COSINE
         )
