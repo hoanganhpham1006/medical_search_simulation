@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import torch
 import numpy as np
 from datasets import load_from_disk, load_dataset, concatenate_datasets
@@ -21,8 +21,10 @@ import httpx
 import signal
 import atexit
 import sys
+import re
 from cache_utils import StartupDataCache
 from faiss_index_manager import FaissIndexManager
+import asyncio
 
 
 # Configure logging
@@ -72,7 +74,7 @@ app = FastAPI(
 metadata_dataset = None
 emb_id_to_metadata_id = {}  # Maps embedding index to metadata row index
 embeddings_matrix = None  # Single concatenated matrix of all embeddings
-url_content_cache = {}  # Cache for URL content to improve /visit performance
+# url_content_cache = {}  # Cache for URL content to improve /visit performance
 sampling_params = None  # Will be initialized based on server mode
 
 
@@ -104,7 +106,8 @@ def start_model_servers():
         "--max-model-len", str(config.MAX_MODEL_LEN),
         "--trust-remote-code",
         "--served-model-name", "embedding-model",
-        "--task", "embed"  # Specify embedding task
+        "--task", "embed",  # Specify embedding task
+        "--hf-overrides", '{"is_matryoshka": true, "matryoshka_dimensions": [256, 512, 1024]}'
     ]
     logger.info(f"Starting VLLM embedding server: {' '.join(embedding_cmd)}")
     embedding_server_process = subprocess.Popen(
@@ -290,7 +293,8 @@ def get_embid2metadata_id(dataset):
 @app.on_event("startup")
 async def startup_event():
     """Initialize model servers and load data on startup"""
-    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, startup_cache, faiss_manager
+    # global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, startup_cache, faiss_manager
+    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, startup_cache, faiss_manager
 
     start_time = time.time()
     logger.info("Starting initialization...")
@@ -325,19 +329,21 @@ async def startup_event():
             logger.info("Attempting to load data from cache...")
             cache_start_time = time.time()
             
-            cached_emb_mapping, cached_url_content = startup_cache.load_cache_data()
+            # cached_emb_mapping, cached_url_content = startup_cache.load_cache_data()
+            cached_emb_mapping = startup_cache.load_cache_data()
             
             if cached_emb_mapping is not None:
                 emb_id_to_metadata_id = cached_emb_mapping
                 logger.info(f"Loaded embedding ID mapping from cache ({len(emb_id_to_metadata_id)} entries)")
                 
-                # Load URL content cache if available
-                if cached_url_content is not None:
-                    url_content_cache = cached_url_content
-                    logger.info(f"Loaded URL content cache from cache ({len(url_content_cache)} entries)")
-                
-                cache_loaded = True
-                logger.info(f"Successfully loaded all data from cache in {time.time() - cache_start_time:.2f} seconds")
+                # # Load URL content cache if available
+                # if cached_url_content is not None:
+                #     url_content_cache = cached_url_content
+                #     logger.info(f"Loaded URL content cache from cache ({len(url_content_cache)} entries)")
+                if os.path.isfile(startup_cache.url_content_cache_db.index_path) and os.path.isfile(startup_cache.url_content_cache_db.data_path):
+                    startup_cache.url_content_cache_db.load()
+                    cache_loaded = True
+                    logger.info(f"Successfully loaded all data from cache in {time.time() - cache_start_time:.2f} seconds")
             else:
                 logger.info("Cache data not available or invalid, proceeding with normal loading")
 
@@ -359,32 +365,23 @@ async def startup_event():
             'passage_id': Sequence(Value('int64'))
         })
 
-        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME}")
-        metadata_dataset_1 = load_dataset(config.METADATA_DATASET_NAME, split="train")
-        metadata_dataset_1 = metadata_dataset_1.remove_columns(['specialty'])
+        metadata_datasets = []
+        for mdn in config.METADATA_DATASET_NAME:
+            md = load_dataset(mdn, split="train")
+            try:
+                md = md.remove_columns(['pid'])
+            except Exception as e:
+                logger.warning(f"Failed to remove pid from {mdn}") 
 
-        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME_2}")
-        metadata_dataset_2 = load_dataset(config.METADATA_DATASET_NAME_2, split="train")
-        metadata_dataset_2 = metadata_dataset_2.remove_columns(['pid', 'specialty'])
-        metadata_dataset_2 = metadata_dataset_2.cast(target_features)
+            try:
+                md = md.remove_columns(['specialty'])
+            except Exception as e:
+                logger.warning(f"Failed to remove specialty from {mdn}")
 
-        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME_3}")
-        metadata_dataset_3 = load_from_disk(config.METADATA_DATASET_NAME_3)
-        metadata_dataset_3 = metadata_dataset_3.remove_columns(['pid', 'specialty'])
-        metadata_dataset_3 = metadata_dataset_3.cast(target_features)
+            md = md.cast(target_features)
+            metadata_datasets.append(md)
 
-        logger.info(f"Loading metadata from {config.METADATA_DATASET_NAME_4}")
-        metadata_dataset_4 = load_dataset(config.METADATA_DATASET_NAME_4, split="train")
-        metadata_dataset_4 = metadata_dataset_4.rename_column("pid", "paper_id")
-        metadata_dataset_4 = metadata_dataset_4.remove_columns(['specialty'])
-        metadata_dataset_4 = metadata_dataset_4.cast(target_features)
-        
-        # Concatenate datasets with automatic passage_id offset
-        datasets = [metadata_dataset_1, metadata_dataset_2, metadata_dataset_3, metadata_dataset_4]
-        dataset_names = ["Wiki Dataset", "FineWeb Dataset", "Semantic Scholar Dataset", "Arvix (TT+A) Dataset"]
-        metadata_dataset = concat_datasets_with_passage_id_offset(datasets, dataset_names)
-        
-        del metadata_dataset_1, metadata_dataset_2, metadata_dataset_3, metadata_dataset_4
+        metadata_dataset = concat_datasets_with_passage_id_offset(metadata_datasets, config.METADATA_DATASET_NAME)
         
         # Only create embedding ID mapping if not loaded from cache
         if not cache_loaded:
@@ -424,60 +421,66 @@ async def startup_event():
         
         # Preload URL content cache only if not loaded from cache
         if not cache_loaded:
-            cache_start_time = time.time()
-            logger.info("Preloading URL content cache using parallel processing...")
+        #     cache_start_time = time.time()
+        #     logger.info("Preloading URL content cache using parallel processing...")
             
-            def process_item(item):
-                """Process a single item to create URL content"""
-                url = item.get("paper_url")
-                if not url:
-                    return None, None
+            # def process_item(item):
+            #     """Process a single item to create URL content"""
+            #     url = item.get("paper_url")
+            #     if not url:
+            #         return None, None
                 
-                # Get paper title
-                paper_title = item.get("paper_title", "Untitled")
+            #     # Get paper title
+            #     paper_title = item.get("paper_title", "Untitled")
                 
-                # Concatenate all passage texts
-                passage_texts = item.get("passage_text", [])
-                if isinstance(passage_texts, list):
-                    full_content = "\n\n".join(str(text) for text in passage_texts if text)
-                else:
-                    full_content = str(passage_texts) if passage_texts else ""
+            #     # Concatenate all passage texts
+            #     passage_texts = item.get("passage_text", [])
+            #     if isinstance(passage_texts, list):
+            #         full_content = "\n\n".join(str(text) for text in passage_texts if text)
+            #     else:
+            #         full_content = str(passage_texts) if passage_texts else ""
                 
-                # Combine title and content
-                unified_content = f"# {paper_title}\n\n{full_content}".strip()
+            #     # Combine title and content
+            #     unified_content = f"# {paper_title}\n\n{full_content}".strip()
                 
-                return url, unified_content
+            #     return url, unified_content
             
-            # Process items in parallel using ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() * 2)) as executor:
-                # Submit all items for processing
-                futures = []
-                for idx, item in enumerate(metadata_dataset):
-                    futures.append(executor.submit(process_item, item))
+            # # Process items in parallel using ThreadPoolExecutor
+            # with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() * 2)) as executor:
+            #     # Submit all items for processing
+            #     futures = []
+            #     for idx, item in enumerate(metadata_dataset):
+            #         futures.append(executor.submit(process_item, item))
                 
-                # Collect results as they complete
-                cache_count = 0
-                for future in futures:
-                    url, content = future.result()
-                    if url and content:
-                        url_content_cache[url] = content
-                        cache_count += 1
+            #     # Collect results as they complete
+            #     cache_count = 0
+            #     for future in futures:
+            #         url, content = future.result()
+            #         if url and content:
+            #             url_content_cache[url] = content
+            #             cache_count += 1
                         
-                        if cache_count % 10000 == 0:
-                            logger.info(f"Cached {cache_count} URLs so far...")
+            #             if cache_count % 10000 == 0:
+            #                 logger.info(f"Cached {cache_count} URLs so far...")
+
+            # logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
             
-            logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
-            if DEBUG_MODE:
-                logger.info(f"DEBUG: Average cache entry size: {sum(len(content) for content in url_content_cache.values()) / len(url_content_cache):.0f} chars")
+            
+            
+            # if DEBUG_MODE:
+            #     logger.info(f"DEBUG: Average cache entry size: {sum(len(content) for content in url_content_cache.values()) / len(url_content_cache):.0f} chars")
         
             # Save to cache if we loaded from source and caching is enabled
             if startup_cache:
+                logger.info("Saving URL-Content to binary cache")
+                startup_cache.url_content_cache_db.build_cache(metadata_dataset)
+
                 logger.info("Saving data to cache for future startups...")
                 save_start_time = time.time()
                 try:
                     startup_cache.save_cache_data(
                         emb_id_to_metadata_id=emb_id_to_metadata_id,
-                        url_content_cache=url_content_cache
+                        # url_content_cache=url_content_cache
                     )
                     logger.info(f"Successfully saved all data to cache in {time.time() - save_start_time:.2f} seconds")
                 except Exception as e:
@@ -535,7 +538,8 @@ async def get_query_embedding(query: str) -> torch.Tensor:
         payload = {
             "model": "embedding-model",  # The served model name we specified
             "input": formatted_input,
-            "encoding_format": "float"
+            "encoding_format": "float",
+            "dimensions": config.EMBEDDING_DIMENSION
         }
         
         # Send request to VLLM's OpenAI-compatible embeddings endpoint
@@ -570,7 +574,8 @@ async def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
         payload = {
             "model": "embedding-model",
             "input": texts,  # Send list of texts for batch processing
-            "encoding_format": "float"
+            "encoding_format": "float",
+            "dimensions": config.EMBEDDING_DIMENSION
         }
         
         # Send request to VLLM's OpenAI-compatible embeddings endpoint
@@ -592,7 +597,82 @@ async def get_text_embeddings_batch(texts: List[str]) -> List[torch.Tensor]:
         return [torch.randn(config.EMBEDDING_DIMENSION) for _ in texts]
 
 
-async def generate_preview(passage_text: str, paper_title: str, query_embedding: torch.Tensor, preview_char: int) -> str:
+async def preprocess_text(text: str) -> List[str]:
+    """
+    Convert text to lowercase and extract words (removing punctuation).
+    """
+    # Convert to lowercase and keep only alphanumeric characters and spaces
+    text = re.sub(r'[^a-zA-Z0-9\s]', '', text.lower())
+    # Split into words and remove empty strings
+    return [word for word in text.split() if word]
+
+
+async def calculate_similarity(query_words: set, sentence_words: set) -> float:
+    """
+    Calculate similarity score based on keyword overlap.
+    """
+    if not query_words or not sentence_words:
+        return 0.0
+    
+    # Count matching keywords
+    matches = len(query_words.intersection(sentence_words))
+    
+    # Calculate score (Jaccard similarity)
+    total_unique = len(query_words.union(sentence_words))
+    if total_unique == 0:
+        return 0.0
+    
+    return matches / total_unique
+
+
+# async def generate_preview(passage_text: str, paper_title: str, query_embedding: torch.Tensor, preview_char: int) -> str:
+#     """Generate a preview of the most relevant chunk from a passage"""
+#     if preview_char <= 0:
+#         return ""
+    
+#     # If passage is shorter than preview_char, return the entire passage
+#     if len(passage_text) <= preview_char:
+#         return passage_text
+    
+#     preview_char = max(preview_char, config.MINIMUM_PREVIEW_CHAR)
+#     try:
+#         # Split passage into chunks of preview_char size (no overlap)
+#         chunks = []
+#         chunk_texts = []
+        
+#         for i in range(0, len(passage_text), preview_char):
+#             chunk = passage_text[i:i + preview_char]
+#             if len(chunk.strip()) > 10:  # Skip too short chunks
+#                 chunks.append(chunk)
+#                 # Format as title + chunk for embedding
+#                 chunk_text = f"{paper_title}\n{chunk}"
+#                 chunk_texts.append(chunk_text)
+        
+#         if not chunks:
+#             return ""
+        
+#         # If only one chunk, return it
+#         if len(chunks) == 1:
+#             return chunks[0]
+        
+#         # Get embeddings for all chunks in batch
+#         chunk_embeddings = await get_text_embeddings_batch(chunk_texts)
+#         # Convert to tensor for similarity computation
+#         chunk_embeddings_tensor = torch.stack(chunk_embeddings)
+#         # Compute similarities with query embedding
+#         similarities = compute_similarity(query_embedding, chunk_embeddings_tensor)
+#         # Find the chunk with highest similarity
+#         best_idx = torch.argmax(similarities).item()
+        
+#         return chunks[best_idx]
+        
+#     except Exception as e:
+#         logger.error(f"Error generating preview: {e}")
+#         # Fallback: return first preview_char characters
+#         return passage_text[:preview_char]
+
+
+async def generate_preview(passage_text: str, paper_title: str, query: str, preview_char: int) -> str:
     """Generate a preview of the most relevant chunk from a passage"""
     if preview_char <= 0:
         return ""
@@ -622,17 +702,16 @@ async def generate_preview(passage_text: str, paper_title: str, query_embedding:
         if len(chunks) == 1:
             return chunks[0]
         
-        # Get embeddings for all chunks in batch
-        chunk_embeddings = await get_text_embeddings_batch(chunk_texts)
-        
-        # Convert to tensor for similarity computation
-        chunk_embeddings_tensor = torch.stack(chunk_embeddings)
-        
-        # Compute similarities with query embedding
-        similarities = compute_similarity(query_embedding, chunk_embeddings_tensor)
-        
+        query_words = set(await preprocess_text(query))
+        processed_chunks = await asyncio.gather(*[preprocess_text(chunk) for chunk in chunk_texts])
+        chunk_texts_words = [set(chunk) for chunk in processed_chunks]
+        # Await all similarity calculations
+        similarities = await asyncio.gather(*[
+            calculate_similarity(query_words, chunk_words) 
+            for chunk_words in chunk_texts_words
+        ])
         # Find the chunk with highest similarity
-        best_idx = torch.argmax(similarities).item()
+        best_idx = np.argmax(similarities).item()
         
         return chunks[best_idx]
         
@@ -913,7 +992,8 @@ async def search(request: SearchRequest):
                     # Get the passage text for this specific passage
                     passage_text = get_passage_text(idx)
                     paper_title = item.get("paper_title", "Unknown Title")
-                    preview = await generate_preview(passage_text, paper_title, query_embedding, request.preview_char)
+                    # preview = await generate_preview(passage_text, paper_title, query_embedding, request.preview_char)
+                    preview = await generate_preview(passage_text, paper_title, query, request.preview_char)
 
                 result = SearchResult(
                     url=item.get("paper_url", f"https://example.com/paper_{paper_id}"),
@@ -952,7 +1032,7 @@ async def visit(request: VisitRequest):
     Now uses pre-cached content for improved performance.
     """
     try:
-        if not url_content_cache:
+        if not startup_cache.url_content_cache_db:
             return VisitResponse(
                 url=request.url, data="Error: Content cache not initialized", status_code=500
             )
@@ -966,8 +1046,13 @@ async def visit(request: VisitRequest):
         logger.info(f"Processing visit request for URL: {url}")
         
         # Check cache first
-        if url in url_content_cache:
-            unified_content = url_content_cache[url]
+        # if url in url_content_cache:
+        #     unified_content = url_content_cache[url]
+        #     logger.info(
+        #         f"Successfully returning cached content for URL: {url} (length: {len(unified_content)} chars)"
+        #     )
+        unified_content = startup_cache.url_content_cache_db.get(url)
+        if unified_content:
             logger.info(
                 f"Successfully returning cached content for URL: {url} (length: {len(unified_content)} chars)"
             )
@@ -1027,9 +1112,9 @@ async def health_check():
             ),
         },
         "cache_statistics": {
-            "url_content_cache_size": len(url_content_cache),
-            "total_cache_memory_mb": sum(len(content) for content in url_content_cache.values()) / (1024 * 1024) if url_content_cache else 0,
-            "cache_initialized": bool(url_content_cache),
+            # "url_content_cache_size": len(url_content_cache),
+            # "total_cache_memory_mb": sum(len(content) for content in url_content_cache.values()) / (1024 * 1024) if url_content_cache else 0,
+            # "cache_initialized": bool(url_content_cache),
             "startup_cache_enabled": config.USE_STARTUP_CACHE,
             "startup_cache_stats": startup_cache.get_cache_stats() if startup_cache else None,
         },

@@ -12,8 +12,78 @@ import json
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import config
+from contextlib import contextmanager
+import struct
+import mmap
 
 logger = logging.getLogger(__name__)
+
+
+class UltraFastBinaryCache:
+    def __init__(self, data_path="cache.bin", index_path="cache.idx"):
+        self.data_path = data_path
+        self.index_path = index_path
+        self.index: Dict[str, Tuple[int, int]] = {}
+    
+    def build_cache(self, metadata_dataset, show_progress=True):
+        """Extremely fast sequential write"""
+        
+        logger.info("Building ultra-fast binary cache...")
+        
+        with open(self.data_path, 'wb') as data_file:
+            offset = 0
+            
+            for i, item in enumerate(metadata_dataset):
+                url = item.get("paper_url")
+                if not url:
+                    continue
+                
+                # Process content
+                paper_title = item.get("paper_title", "Untitled")
+                passage_texts = item.get("passage_text", [])
+                
+                if isinstance(passage_texts, list):
+                    full_content = "\n\n".join(str(text) for text in passage_texts if text)
+                else:
+                    full_content = str(passage_texts) if passage_texts else ""
+                
+                unified_content = f"# {paper_title}\n\n{full_content}".strip()
+                content_bytes = unified_content.encode('utf-8')
+                
+                # Write to file
+                length = len(content_bytes)
+                data_file.write(struct.pack('I', length))
+                data_file.write(content_bytes)
+                
+                # Update index
+                self.index[url] = (offset, length)
+                offset += 4 + length  # 4 bytes for length + content
+                
+                if show_progress and (i + 1) % 10000000 == 0:
+                    logger.info(f"Processed {i+1:,} URLs...")
+        
+        # Save index
+        with open(self.index_path, 'wb') as f:
+            pickle.dump(self.index, f, protocol=pickle.HIGHEST_PROTOCOL)
+        
+        logger.info(f"Cache complete! {len(self.index):,} URLs indexed")
+    
+    def load(self):
+        """Load for reading"""
+        with open(self.index_path, 'rb') as f:
+            self.index = pickle.load(f)
+        
+        self.data_file = open(self.data_path, 'rb')
+        self.mmap = mmap.mmap(self.data_file.fileno(), 0, access=mmap.ACCESS_READ)
+    
+    def get(self, url):
+        if url not in self.index:
+            return None
+        
+        offset, length = self.index[url]
+        self.mmap.seek(offset + 4)  # Skip length header
+        return self.mmap.read(length).decode('utf-8')
+
 
 class StartupDataCache:
     """Manages caching for startup data including embeddings, metadata mappings, and URL content"""
@@ -24,7 +94,8 @@ class StartupDataCache:
         
         # Cache file paths
         self.emb_id_mapping_file = self.cache_dir / "emb_id_to_metadata_id.pkl"
-        self.url_content_cache_file = self.cache_dir / "url_content_cache.pkl"
+        # self.url_content_cache_file = self.cache_dir / "url_content_cache.pkl"
+        self.url_content_cache_db = UltraFastBinaryCache(data_path = self.cache_dir / "url_content_cache.bin", index_path = self.cache_dir / "url_content_cache.idx")
         self.cache_info_file = self.cache_dir / "cache_info_new.json"
         
         logger.info(f"Cache directory: {self.cache_dir}")
@@ -76,7 +147,9 @@ class StartupDataCache:
             # Check if all required cache files exist
             required_files = [
                 self.emb_id_mapping_file,
-                self.url_content_cache_file
+                # self.url_content_cache_file
+                self.url_content_cache_db.data_path,
+                self.url_content_cache_db.index_path,
             ]
             
             for file_path in required_files:
@@ -128,35 +201,35 @@ class StartupDataCache:
     
     # Quantization cache methods removed - FAISS handles quantization internally
     
-    def save_url_content_cache(self, url_content_cache: Dict[str, str]):
-        """Save URL content cache"""
-        try:
-            logger.info(f"Saving URL content cache ({len(url_content_cache)} entries)")
-            with open(self.url_content_cache_file, 'wb') as f:
-                pickle.dump(url_content_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+    # def save_url_content_cache(self, url_content_cache: Dict[str, str]):
+    #     """Save URL content cache"""
+    #     try:
+    #         logger.info(f"Saving URL content cache ({len(url_content_cache)} entries)")
+    #         with open(self.url_content_cache_file, 'wb') as f:
+    #             pickle.dump(url_content_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
             
-            # Calculate total size
-            total_size = sum(len(content) for content in url_content_cache.values())
-            logger.info(f"Saved URL content cache to {self.url_content_cache_file} ({total_size / (1024*1024):.1f} MB)")
+    #         # Calculate total size
+    #         total_size = sum(len(content) for content in url_content_cache.values())
+    #         logger.info(f"Saved URL content cache to {self.url_content_cache_file} ({total_size / (1024*1024):.1f} MB)")
             
-        except Exception as e:
-            logger.error(f"Failed to save URL content cache: {e}")
+    #     except Exception as e:
+    #         logger.error(f"Failed to save URL content cache: {e}")
     
-    def load_url_content_cache(self) -> Optional[Dict[str, str]]:
-        """Load URL content cache"""
-        try:
-            if self.url_content_cache_file.exists():
-                logger.info("Loading URL content cache from cache")
-                with open(self.url_content_cache_file, 'rb') as f:
-                    cache = pickle.load(f)
+    # def load_url_content_cache(self) -> Optional[Dict[str, str]]:
+    #     """Load URL content cache"""
+    #     try:
+    #         if self.url_content_cache_file.exists():
+    #             logger.info("Loading URL content cache from cache")
+    #             with open(self.url_content_cache_file, 'rb') as f:
+    #                 cache = pickle.load(f)
                 
-                total_size = sum(len(content) for content in cache.values())
-                logger.info(f"Loaded URL content cache ({len(cache)} entries, {total_size / (1024*1024):.1f} MB)")
-                return cache
+    #             total_size = sum(len(content) for content in cache.values())
+    #             logger.info(f"Loaded URL content cache ({len(cache)} entries, {total_size / (1024*1024):.1f} MB)")
+    #             return cache
                 
-        except Exception as e:
-            logger.error(f"Failed to load URL content cache: {e}")
-        return None
+    #     except Exception as e:
+    #         logger.error(f"Failed to load URL content cache: {e}")
+    #     return None
     
     def save_cache_data(self, emb_id_to_metadata_id: Dict[int, int], 
                        url_content_cache: Optional[Dict[str, str]] = None):
@@ -165,8 +238,8 @@ class StartupDataCache:
             # Save individual components
             self.save_emb_id_mapping(emb_id_to_metadata_id)
             
-            if url_content_cache is not None:
-                self.save_url_content_cache(url_content_cache)
+            # if url_content_cache is not None:
+            #     self.save_url_content_cache(url_content_cache)
             
             # Update cache info
             cache_info = {
@@ -185,7 +258,7 @@ class StartupDataCache:
         """Load cached data"""
         if not self.is_cache_valid():
             logger.info("Cache is invalid, will not load")
-            return None, None
+            return None
         
         try:
             logger.info("Loading data from cache")
@@ -193,14 +266,15 @@ class StartupDataCache:
             # Load mapping
             emb_id_mapping = self.load_emb_id_mapping()
             
-            # Load URL content cache
-            url_content_cache = self.load_url_content_cache()
+            # # Load URL content cache
+            # url_content_cache = self.load_url_content_cache()
             
-            return emb_id_mapping, url_content_cache
+            # return emb_id_mapping, url_content_cache
+            return emb_id_mapping
             
         except Exception as e:
             logger.error(f"Failed to load cache data: {e}")
-            return None, None
+            return None
     
     def clear_cache(self):
         """Clear all cached files"""
@@ -210,7 +284,7 @@ class StartupDataCache:
                 self.emb_id_mapping_file,
                 self.quantized_embeddings_file,
                 self.quantization_metadata_file, 
-                self.url_content_cache_file,
+                self.url_content_cache_db.db_path,
                 self.cache_info_file
             ]:
                 if file_path.exists():
@@ -232,7 +306,8 @@ class StartupDataCache:
             ('emb_id_mapping', self.emb_id_mapping_file),
             ('quantized_embeddings', self.quantized_embeddings_file),
             ('quantization_metadata', self.quantization_metadata_file),
-            ('url_content_cache', self.url_content_cache_file),
+            # ('url_content_cache', self.url_content_cache_file),
+            ('url_content_cache_db', self.url_content_cache_db.db_path),
             ('cache_info', self.cache_info_file)
         ]:
             if file_path.exists():

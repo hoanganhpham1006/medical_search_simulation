@@ -145,7 +145,10 @@ class FaissIndexManager:
                 embeddings = torch.load(file_path, map_location="cpu")
                 if embeddings.dim() == 1:
                     embeddings = embeddings.unsqueeze(0)
-                return file_idx, embeddings
+                if embeddings.shape[1] < self.embedding_dimension:
+                    logger.warning(f"Embedding dimension mismatch for file {file_path}: {embeddings.shape[1]} < {self.embedding_dimension}")
+                    return file_idx, None
+                return file_idx, embeddings[:, :self.embedding_dimension]
             except Exception as e:
                 logger.warning(f"Failed to load {file_path}: {e}")
                 return file_idx, None
@@ -286,14 +289,17 @@ class FaissIndexManager:
             # Collect training samples from a subset of files
             # Need ~10M training points for 262k clusters. With 512 samples per file, need ~20k files
             num_training_files = min(max_files, max_files)  # Use all available files for training
-            step = max(1, max_files // 20000)  # Sample enough files to get 20k files total
+            step = max(1, max_files // 10000)  # Sample enough files to get 15k files total
             for i in range(0, num_training_files, step):
                 file_path = os.path.join(embedding_folder, f"embeddings_{i}.pt")
                 try:
                     embeddings = torch.load(file_path, map_location="cpu")
                     if embeddings.dim() == 1:
                         embeddings = embeddings.unsqueeze(0)
-                    
+                    if embeddings.shape[1] < self.embedding_dimension:
+                        logger.warning(f"Embedding dimension mismatch for file {file_path}: {embeddings.shape[1]} < {self.embedding_dimension}")
+                        continue
+                    embeddings = embeddings[:, :self.embedding_dimension]
                     # Convert to numpy
                     embeddings_np = embeddings.numpy().astype(np.float32)
                     
@@ -335,6 +341,10 @@ class FaissIndexManager:
                 embeddings = torch.load(file_path, map_location="cpu")
                 if embeddings.dim() == 1:
                     embeddings = embeddings.unsqueeze(0)
+                if embeddings.shape[1] < self.embedding_dimension:
+                    logger.warning(f"Embedding dimension mismatch for file {file_path}: {embeddings.shape[1]} < {self.embedding_dimension}")
+                    return file_idx, None
+                embeddings = embeddings[:, :self.embedding_dimension]
                 
                 # Convert to numpy
                 embeddings_np = embeddings.numpy().astype(np.float32)
@@ -351,9 +361,9 @@ class FaissIndexManager:
                 return file_idx, None
         
         # Process files in batches
+        logger.info(f"Processing embedding by batch..")
         for batch_start in range(0, max_files, batch_size):
             batch_end = min(batch_start + batch_size, max_files)
-            logger.info(f"Processing embedding batch {batch_start}-{batch_end-1}")
             
             # Load files in parallel
             batch_embeddings = []
@@ -371,8 +381,7 @@ class FaissIndexManager:
                 batch_matrix = np.vstack(batch_embeddings)
                 index.add(batch_matrix)
                 total_added += len(batch_matrix)
-                logger.info(f"Added {len(batch_matrix)} vectors (total: {total_added})")
-                
+
                 # Clear batch to free memory
                 del batch_embeddings
                 del batch_matrix
