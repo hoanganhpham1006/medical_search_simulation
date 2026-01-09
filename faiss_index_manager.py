@@ -20,7 +20,7 @@ class FaissIndexManager:
     """
     Manages FAISS indexes for multi-GPU similarity search
     """
-    
+
     def __init__(self, embedding_dimension: int = 4096):
         self.embedding_dimension = embedding_dimension
         self.cpu_index = None
@@ -28,73 +28,67 @@ class FaissIndexManager:
         self.index_lock = threading.Lock()
         self.num_gpus = faiss.get_num_gpus()
         logger.info(f"Initialized FAISS manager with {self.num_gpus} GPUs")
-        
-    def create_index(self, 
-                     index_type: str = "IVFFlat", 
+
+    def _get_metric(self, use_cosine: bool) -> int:
+        """Get the FAISS metric type based on similarity mode."""
+        return faiss.METRIC_INNER_PRODUCT if use_cosine else faiss.METRIC_L2
+
+    def _normalize_embeddings(self, embeddings: np.ndarray) -> np.ndarray:
+        """Normalize embeddings for cosine similarity."""
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        return embeddings / norms
+
+    def _create_flat_quantizer(self, use_cosine: bool) -> faiss.Index:
+        """Create a flat quantizer with the appropriate metric."""
+        if use_cosine:
+            return faiss.IndexFlatIP(self.embedding_dimension)
+        return faiss.IndexFlatL2(self.embedding_dimension)
+
+    def create_index(self,
+                     index_type: str = "IVFFlat",
                      nlist: int = 1024,
                      use_cosine: bool = True,
                      hnsw_m: int = 32,
                      hnsw_efConstruction: int = 200) -> faiss.Index:
         """
         Create a FAISS index based on configuration
-        
+
         Args:
             index_type: Type of index ("Flat", "IVFFlat", "IVFPQ", "IVFHNSW")
             nlist: Number of clusters for IVF indexes
             use_cosine: Whether to use cosine similarity (L2 otherwise)
             hnsw_m: Number of bi-directional links for HNSW (default: 32)
             hnsw_efConstruction: Size of dynamic candidate list for HNSW construction (default: 200)
-            
+
         Returns:
             FAISS index instance
         """
         logger.info(f"Creating FAISS {index_type} index with dimension {self.embedding_dimension}")
-        
-        if use_cosine:
-            # For cosine similarity, we'll normalize vectors and use IP (Inner Product)
-            if index_type == "Flat":
+
+        metric = self._get_metric(use_cosine)
+
+        if index_type == "Flat":
+            if use_cosine:
                 index = faiss.IndexFlatIP(self.embedding_dimension)
-            elif index_type == "IVFFlat":
-                quantizer = faiss.IndexFlatIP(self.embedding_dimension)
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_INNER_PRODUCT)
-            elif index_type == "IVFPQ":
-                quantizer = faiss.IndexFlatIP(self.embedding_dimension)
-                # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
-                m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
-                nbits = 8  # bits per subvector
-                index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_INNER_PRODUCT)
-            elif index_type == "IVFHNSW":
-                # Create HNSW quantizer for fast cluster assignment
-                quantizer = faiss.IndexHNSWFlat(self.embedding_dimension, hnsw_m, faiss.METRIC_INNER_PRODUCT)
-                quantizer.hnsw.efConstruction = hnsw_efConstruction
-                # Create IVF index with HNSW quantizer
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_INNER_PRODUCT)
-                logger.info(f"Created IVFHNSW index with M={hnsw_m}, efConstruction={hnsw_efConstruction}, nlist={nlist}")
             else:
-                raise ValueError(f"Unsupported index type: {index_type}")
-        else:
-            # L2 distance
-            if index_type == "Flat":
                 index = faiss.IndexFlatL2(self.embedding_dimension)
-            elif index_type == "IVFFlat":
-                quantizer = faiss.IndexFlatL2(self.embedding_dimension)
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_L2)
-            elif index_type == "IVFPQ":
-                quantizer = faiss.IndexFlatL2(self.embedding_dimension)
-                # Use 32 subvectors with 8 bits each (PQ32x8) to fit GPU shared memory constraints
-                m = 32  # number of subvectors (reduced from 64 to fit GPU memory)
-                nbits = 8  # bits per subvector
-                index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, faiss.METRIC_L2)
-            elif index_type == "IVFHNSW":
-                # Create HNSW quantizer for fast cluster assignment
-                quantizer = faiss.IndexHNSWFlat(self.embedding_dimension, hnsw_m, faiss.METRIC_L2)
-                quantizer.hnsw.efConstruction = hnsw_efConstruction
-                # Create IVF index with HNSW quantizer
-                index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, faiss.METRIC_L2)
-                logger.info(f"Created IVFHNSW index with M={hnsw_m}, efConstruction={hnsw_efConstruction}, nlist={nlist}")
-            else:
-                raise ValueError(f"Unsupported index type: {index_type}")
-        
+        elif index_type == "IVFFlat":
+            quantizer = self._create_flat_quantizer(use_cosine)
+            index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, metric)
+        elif index_type == "IVFPQ":
+            quantizer = self._create_flat_quantizer(use_cosine)
+            m = 32  # number of subvectors
+            nbits = 8  # bits per subvector
+            index = faiss.IndexIVFPQ(quantizer, self.embedding_dimension, nlist, m, nbits, metric)
+        elif index_type == "IVFHNSW":
+            quantizer = faiss.IndexHNSWFlat(self.embedding_dimension, hnsw_m, metric)
+            quantizer.hnsw.efConstruction = hnsw_efConstruction
+            index = faiss.IndexIVFFlat(quantizer, self.embedding_dimension, nlist, metric)
+            logger.info(f"Created IVFHNSW index with M={hnsw_m}, efConstruction={hnsw_efConstruction}, nlist={nlist}")
+        else:
+            raise ValueError(f"Unsupported index type: {index_type}")
+
         logger.info(f"Created {index_type} index: {index}")
         return index
     
@@ -188,9 +182,7 @@ class FaissIndexManager:
         # Normalize for cosine similarity if requested
         if normalize:
             logger.info("Normalizing embeddings for cosine similarity...")
-            norms = np.linalg.norm(embeddings_matrix, axis=1, keepdims=True)
-            norms[norms == 0] = 1  # Avoid division by zero
-            embeddings_matrix = embeddings_matrix / norms
+            embeddings_matrix = self._normalize_embeddings(embeddings_matrix)
         
         logger.info(f"Loaded embeddings matrix: {embeddings_matrix.shape} in {time.time() - start_time:.2f}s")
         return embeddings_matrix
@@ -302,13 +294,11 @@ class FaissIndexManager:
                     embeddings = embeddings[:, :self.embedding_dimension]
                     # Convert to numpy
                     embeddings_np = embeddings.numpy().astype(np.float32)
-                    
+
                     # Normalize if using cosine
                     if use_cosine:
-                        norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
-                        norms[norms == 0] = 1
-                        embeddings_np = embeddings_np / norms
-                    
+                        embeddings_np = self._normalize_embeddings(embeddings_np)
+
                     # Sample some vectors for training
                     n_samples = min(training_samples_per_file, len(embeddings_np))
                     if len(embeddings_np) > n_samples:
@@ -348,18 +338,16 @@ class FaissIndexManager:
                 
                 # Convert to numpy
                 embeddings_np = embeddings.numpy().astype(np.float32)
-                
+
                 # Normalize if using cosine
                 if use_cosine:
-                    norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
-                    norms[norms == 0] = 1
-                    embeddings_np = embeddings_np / norms
-                
+                    embeddings_np = self._normalize_embeddings(embeddings_np)
+
                 return file_idx, embeddings_np
             except Exception as e:
                 logger.warning(f"Failed to load {file_path}: {e}")
                 return file_idx, None
-        
+
         # Process files in batches
         logger.info(f"Processing embedding by batch..")
         for batch_start in range(0, max_files, batch_size):
@@ -543,13 +531,11 @@ class FaissIndexManager:
             query_embeddings = query_embeddings.reshape(1, -1)
         
         query_embeddings = query_embeddings.astype(np.float32)
-        
+
         # Normalize if requested
         if normalize_query:
-            norms = np.linalg.norm(query_embeddings, axis=1, keepdims=True)
-            norms[norms == 0] = 1
-            query_embeddings = query_embeddings / norms
-        
+            query_embeddings = self._normalize_embeddings(query_embeddings)
+
         # Perform search
         with self.index_lock:
             distances, indices = search_index.search(query_embeddings, k)
@@ -651,9 +637,7 @@ class FaissIndexManager:
             # Normalize embeddings if using cosine similarity
             if use_cosine:
                 logger.info("Normalizing embeddings for cosine similarity...")
-                norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-                norms[norms == 0] = 1  # Avoid division by zero
-                embeddings = embeddings / norms
+                embeddings = self._normalize_embeddings(embeddings)
             
             # Build and train index
             self.cpu_index = self.build_and_train_index(

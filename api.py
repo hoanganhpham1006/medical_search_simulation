@@ -3,9 +3,8 @@ from pydantic import BaseModel
 from typing import List, Dict, Any, Optional, Tuple
 import torch
 import numpy as np
-from datasets import load_from_disk, load_dataset, concatenate_datasets
+from datasets import load_dataset, concatenate_datasets
 import os
-import glob
 import asyncio
 from pathlib import Path
 import logging
@@ -13,8 +12,6 @@ import config
 import time
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import threading
-from queue import Queue
 import subprocess
 import requests
 import httpx
@@ -24,7 +21,6 @@ import sys
 import re
 from cache_utils import StartupDataCache
 from faiss_index_manager import FaissIndexManager
-import asyncio
 
 
 # Configure logging
@@ -73,10 +69,6 @@ app = FastAPI(
 
 metadata_dataset = None
 emb_id_to_metadata_id = {}  # Maps embedding index to metadata row index
-embeddings_matrix = None  # Single concatenated matrix of all embeddings
-# url_content_cache = {}  # Cache for URL content to improve /visit performance
-sampling_params = None  # Will be initialized based on server mode
-
 
 # FAISS-related variables
 faiss_manager = None  # FaissIndexManager instance
@@ -112,32 +104,11 @@ def start_model_servers():
     logger.info(f"Starting VLLM embedding server: {' '.join(embedding_cmd)}")
     embedding_server_process = subprocess.Popen(
         embedding_cmd,
-        stdout=subprocess.DEVNULL, # Discard stdout
-        stderr=subprocess.DEVNULL,  # Discard stderr
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         env={**os.environ, "CUDA_VISIBLE_DEVICES": config.EMBEDDING_GPU_DEVICES}
     )
-    
-    # Start reranker server using vllm serve
-    # reranker_cmd = [
-    #     sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-    #     "--model", config.RERANKER_MODEL_NAME,
-    #     "--port", str(config.RERANKER_SERVER_PORT),
-    #     "--host", config.RERANKER_SERVER_HOST,
-    #     "--tensor-parallel-size", str(config.RERANK_TENSOR_PARALLEL_SIZE),
-    #     "--gpu-memory-utilization", str(config.RERANK_GPU_MEMORY_UTILIZATION),
-    #     "--max-model-len", str(config.MAX_RERANK_LEN),
-    #     "--trust-remote-code",
-    #     "--served-model-name", "reranker-model",
-    #     "--max_logprobs", str(config.RERANK_MAX_LOGPROBS),
-    # ]
-    # logger.info(f"Starting VLLM reranker server: {' '.join(reranker_cmd)}")
-    # reranker_server_process = subprocess.Popen(
-    #     reranker_cmd,
-    #     stdout=subprocess.DEVNULL,
-    #     stderr=subprocess.DEVNULL,
-    #     env={**os.environ, "CUDA_VISIBLE_DEVICES": config.RERANK_GPU_DEVICES}
-    # )
-    
+
     # Wait for servers to be ready using VLLM's OpenAI-compatible health endpoint
     embedding_url = f"http://{config.EMBEDDING_SERVER_HOST}:{config.EMBEDDING_SERVER_PORT}/health"
     reranker_url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/health"
@@ -290,11 +261,117 @@ def get_embid2metadata_id(dataset):
     return passage_id_to_metadata_id
 
 
+def _load_cache_data() -> Tuple[Optional[Dict[int, int]], bool]:
+    """
+    Attempt to load data from startup cache.
+
+    Returns:
+        Tuple of (emb_id_mapping, cache_loaded_successfully)
+    """
+    if not startup_cache or config.FORCE_CACHE_REBUILD:
+        return None, False
+
+    logger.info("Attempting to load data from cache...")
+    cache_start_time = time.time()
+
+    cached_emb_mapping = startup_cache.load_cache_data()
+    if cached_emb_mapping is None:
+        logger.info("Cache data not available or invalid, proceeding with normal loading")
+        return None, False
+
+    logger.info(f"Loaded embedding ID mapping from cache ({len(cached_emb_mapping)} entries)")
+
+    cache_data_exists = (
+        os.path.isfile(startup_cache.url_content_cache_db.index_path) and
+        os.path.isfile(startup_cache.url_content_cache_db.data_path)
+    )
+    if cache_data_exists:
+        startup_cache.url_content_cache_db.load()
+        logger.info(f"Successfully loaded all data from cache in {time.time() - cache_start_time:.2f} seconds")
+        return cached_emb_mapping, True
+
+    return cached_emb_mapping, False
+
+
+def _setup_faiss_index() -> FaissIndexManager:
+    """Initialize and setup the FAISS index manager."""
+    manager = FaissIndexManager(embedding_dimension=config.EMBEDDING_DIMENSION)
+
+    load_path = config.FAISS_INDEX_PATH if os.path.exists(config.FAISS_INDEX_PATH) else None
+    manager.setup_index_incremental(
+        embedding_folder=config.EMBEDDING_FOLDER,
+        max_files=config.MAX_EMBEDDING_FILES,
+        index_type=config.FAISS_INDEX_TYPE,
+        nlist=config.FAISS_NLIST,
+        use_cosine=config.FAISS_USE_COSINE,
+        gpu_devices=config.FAISS_GPU_DEVICES,
+        save_path=config.FAISS_INDEX_PATH,
+        load_path=load_path,
+        hnsw_m=config.FAISS_HNSW_M,
+        hnsw_efConstruction=config.FAISS_HNSW_EF_CONSTRUCTION
+    )
+
+    logger.info(f"FAISS stats: {manager.get_stats()}")
+    torch.cuda.empty_cache()
+    logger.info("FAISS index setup completed and GPU memory cleared")
+
+    return manager
+
+
+def _save_startup_cache(emb_id_mapping: Dict[int, int], dataset) -> None:
+    """Save data to startup cache for future use."""
+    if not startup_cache:
+        return
+
+    logger.info("Saving URL-Content to binary cache")
+    startup_cache.url_content_cache_db.build_cache(dataset)
+
+    logger.info("Saving data to cache for future startups...")
+    save_start_time = time.time()
+    try:
+        startup_cache.save_cache_data(emb_id_to_metadata_id=emb_id_mapping)
+        logger.info(f"Successfully saved all data to cache in {time.time() - save_start_time:.2f} seconds")
+    except Exception as e:
+        logger.error(f"Failed to save data to cache: {e}")
+
+
+def _load_metadata_datasets():
+    """Load and combine metadata datasets with passage ID offsets."""
+    from datasets import Features, Sequence, Value
+
+    target_features = Features({
+        'paper_url': Value('string'),
+        'paper_id': Value('string'),
+        'paper_title': Value('string'),
+        'year': Value('float64'),
+        'venue': Value('string'),
+        'passage_text': Sequence(Value('string')),
+        'passage_id': Sequence(Value('int64'))
+    })
+
+    metadata_datasets = []
+    for mdn in config.METADATA_DATASET_NAME:
+        md = load_dataset(mdn, split="train")
+        try:
+            md = md.remove_columns(['pid'])
+        except Exception:
+            logger.warning(f"Failed to remove pid from {mdn}")
+
+        try:
+            md = md.remove_columns(['specialty'])
+        except Exception:
+            logger.warning(f"Failed to remove specialty from {mdn}")
+
+        md = md.cast(target_features)
+        metadata_datasets.append(md)
+
+    return concat_datasets_with_passage_id_offset(metadata_datasets, config.METADATA_DATASET_NAME)
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Initialize model servers and load data on startup"""
-    # global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, url_content_cache, startup_cache, faiss_manager
-    global metadata_dataset, emb_id_to_metadata_id, embeddings_matrix, startup_cache, faiss_manager
+    """Initialize model servers and load data on startup."""
+    global metadata_dataset, emb_id_to_metadata_id, startup_cache, faiss_manager
 
     start_time = time.time()
     logger.info("Starting initialization...")
@@ -309,184 +386,50 @@ async def startup_event():
         else:
             logger.info("Startup caching disabled")
             startup_cache = None
+
         # Start the model servers
         logger.info("Starting model servers...")
         start_model_servers()
-        
+
         # Register cleanup on exit
         atexit.register(stop_model_servers)
-        
+
         def signal_handler(signum, frame):
             stop_model_servers()
             sys.exit(0)
-            
+
         signal.signal(signal.SIGTERM, signal_handler)
         signal.signal(signal.SIGINT, signal_handler)
 
         # Try to load from cache first
-        cache_loaded = False
-        if startup_cache and not config.FORCE_CACHE_REBUILD:
-            logger.info("Attempting to load data from cache...")
-            cache_start_time = time.time()
-            
-            # cached_emb_mapping, cached_url_content = startup_cache.load_cache_data()
-            cached_emb_mapping = startup_cache.load_cache_data()
-            
-            if cached_emb_mapping is not None:
-                emb_id_to_metadata_id = cached_emb_mapping
-                logger.info(f"Loaded embedding ID mapping from cache ({len(emb_id_to_metadata_id)} entries)")
-                
-                # # Load URL content cache if available
-                # if cached_url_content is not None:
-                #     url_content_cache = cached_url_content
-                #     logger.info(f"Loaded URL content cache from cache ({len(url_content_cache)} entries)")
-                if os.path.isfile(startup_cache.url_content_cache_db.index_path) and os.path.isfile(startup_cache.url_content_cache_db.data_path):
-                    startup_cache.url_content_cache_db.load()
-                    cache_loaded = True
-                    logger.info(f"Successfully loaded all data from cache in {time.time() - cache_start_time:.2f} seconds")
-            else:
-                logger.info("Cache data not available or invalid, proceeding with normal loading")
+        cached_mapping, cache_loaded = _load_cache_data()
+        if cached_mapping is not None:
+            emb_id_to_metadata_id = cached_mapping
 
         if not cache_loaded:
             logger.info("Loading data from source (cache not used)")
 
         # Load metadata datasets
         metadata_start_time = time.time()
+        metadata_dataset = _load_metadata_datasets()
 
-        from datasets import Features, Sequence, Value
-        target_features = Features({
-            'paper_url': Value('string'),
-            'paper_id': Value('string'), 
-            'paper_title': Value('string'),
-            'year': Value('float64'),
-            'venue': Value('string'),
-            'passage_text': Sequence(Value('string')),
-            # 'specialty': Sequence(Value('string')),
-            'passage_id': Sequence(Value('int64'))
-        })
-
-        metadata_datasets = []
-        for mdn in config.METADATA_DATASET_NAME:
-            md = load_dataset(mdn, split="train")
-            try:
-                md = md.remove_columns(['pid'])
-            except Exception as e:
-                logger.warning(f"Failed to remove pid from {mdn}") 
-
-            try:
-                md = md.remove_columns(['specialty'])
-            except Exception as e:
-                logger.warning(f"Failed to remove specialty from {mdn}")
-
-            md = md.cast(target_features)
-            metadata_datasets.append(md)
-
-        metadata_dataset = concat_datasets_with_passage_id_offset(metadata_datasets, config.METADATA_DATASET_NAME)
-        
         # Only create embedding ID mapping if not loaded from cache
         if not cache_loaded:
-            logger.info(f"Creating embedding ID to metadata ID mappings..")
+            logger.info("Creating embedding ID to metadata ID mappings...")
             emb_id_to_metadata_id = get_embid2metadata_id(metadata_dataset)
-        
+
         logger.info(f"Loaded {len(metadata_dataset)} metadata records")
         logger.info(f"Total embedding ID to metadata ID mappings: {len(emb_id_to_metadata_id)}")
         if DEBUG_MODE:
             logger.info(f"DEBUG: Metadata loaded in {time.time() - metadata_start_time:.2f} seconds")
 
-        # Initialize FAISS manager
-        faiss_manager = FaissIndexManager(embedding_dimension=config.EMBEDDING_DIMENSION)
+        # Setup FAISS index
+        faiss_manager = _setup_faiss_index()
 
-        # Setup FAISS index using incremental loading
-        # FAISS will load original embeddings in batches and handle its own quantization
-        faiss_manager.setup_index_incremental(
-            embedding_folder=config.EMBEDDING_FOLDER,
-            max_files=config.MAX_EMBEDDING_FILES,
-            index_type=config.FAISS_INDEX_TYPE,
-            nlist=config.FAISS_NLIST,
-            use_cosine=config.FAISS_USE_COSINE,
-            gpu_devices=config.FAISS_GPU_DEVICES,
-            save_path=config.FAISS_INDEX_PATH,
-            load_path=config.FAISS_INDEX_PATH if os.path.exists(config.FAISS_INDEX_PATH) else None,
-            hnsw_m=config.FAISS_HNSW_M,
-            hnsw_efConstruction=config.FAISS_HNSW_EF_CONSTRUCTION
-        )
-        
-        faiss_start_time = time.time()
-        logger.info(f"FAISS setup completed in {time.time() - faiss_start_time:.2f} seconds")
-        logger.info(f"FAISS stats: {faiss_manager.get_stats()}")
-        
-        # FAISS handles all embedding storage and memory management
-        torch.cuda.empty_cache()
-        logger.info("FAISS index setup completed and GPU memory cleared")
-        
-        # Preload URL content cache only if not loaded from cache
+        # Build cache if not loaded from cache
         if not cache_loaded:
-        #     cache_start_time = time.time()
-        #     logger.info("Preloading URL content cache using parallel processing...")
-            
-            # def process_item(item):
-            #     """Process a single item to create URL content"""
-            #     url = item.get("paper_url")
-            #     if not url:
-            #         return None, None
-                
-            #     # Get paper title
-            #     paper_title = item.get("paper_title", "Untitled")
-                
-            #     # Concatenate all passage texts
-            #     passage_texts = item.get("passage_text", [])
-            #     if isinstance(passage_texts, list):
-            #         full_content = "\n\n".join(str(text) for text in passage_texts if text)
-            #     else:
-            #         full_content = str(passage_texts) if passage_texts else ""
-                
-            #     # Combine title and content
-            #     unified_content = f"# {paper_title}\n\n{full_content}".strip()
-                
-            #     return url, unified_content
-            
-            # # Process items in parallel using ThreadPoolExecutor
-            # with ThreadPoolExecutor(max_workers=min(32, os.cpu_count() * 2)) as executor:
-            #     # Submit all items for processing
-            #     futures = []
-            #     for idx, item in enumerate(metadata_dataset):
-            #         futures.append(executor.submit(process_item, item))
-                
-            #     # Collect results as they complete
-            #     cache_count = 0
-            #     for future in futures:
-            #         url, content = future.result()
-            #         if url and content:
-            #             url_content_cache[url] = content
-            #             cache_count += 1
-                        
-            #             if cache_count % 10000 == 0:
-            #                 logger.info(f"Cached {cache_count} URLs so far...")
+            _save_startup_cache(emb_id_to_metadata_id, metadata_dataset)
 
-            # logger.info(f"URL content cache preloaded with {cache_count} entries in {time.time() - cache_start_time:.2f} seconds")
-            
-            
-            
-            # if DEBUG_MODE:
-            #     logger.info(f"DEBUG: Average cache entry size: {sum(len(content) for content in url_content_cache.values()) / len(url_content_cache):.0f} chars")
-        
-            # Save to cache if we loaded from source and caching is enabled
-            if startup_cache:
-                logger.info("Saving URL-Content to binary cache")
-                startup_cache.url_content_cache_db.build_cache(metadata_dataset)
-
-                logger.info("Saving data to cache for future startups...")
-                save_start_time = time.time()
-                try:
-                    startup_cache.save_cache_data(
-                        emb_id_to_metadata_id=emb_id_to_metadata_id,
-                        # url_content_cache=url_content_cache
-                    )
-                    logger.info(f"Successfully saved all data to cache in {time.time() - save_start_time:.2f} seconds")
-                except Exception as e:
-                    logger.error(f"Failed to save data to cache: {e}")
-                    # Don't fail startup if cache saving fails
-        
         logger.info("Model initialization completed!")
         if DEBUG_MODE:
             logger.info(f"DEBUG: Total initialization time: {time.time() - start_time:.2f} seconds")
@@ -625,53 +568,6 @@ async def calculate_similarity(query_words: set, sentence_words: set) -> float:
     return matches / total_unique
 
 
-# async def generate_preview(passage_text: str, paper_title: str, query_embedding: torch.Tensor, preview_char: int) -> str:
-#     """Generate a preview of the most relevant chunk from a passage"""
-#     if preview_char <= 0:
-#         return ""
-    
-#     # If passage is shorter than preview_char, return the entire passage
-#     if len(passage_text) <= preview_char:
-#         return passage_text
-    
-#     preview_char = max(preview_char, config.MINIMUM_PREVIEW_CHAR)
-#     try:
-#         # Split passage into chunks of preview_char size (no overlap)
-#         chunks = []
-#         chunk_texts = []
-        
-#         for i in range(0, len(passage_text), preview_char):
-#             chunk = passage_text[i:i + preview_char]
-#             if len(chunk.strip()) > 10:  # Skip too short chunks
-#                 chunks.append(chunk)
-#                 # Format as title + chunk for embedding
-#                 chunk_text = f"{paper_title}\n{chunk}"
-#                 chunk_texts.append(chunk_text)
-        
-#         if not chunks:
-#             return ""
-        
-#         # If only one chunk, return it
-#         if len(chunks) == 1:
-#             return chunks[0]
-        
-#         # Get embeddings for all chunks in batch
-#         chunk_embeddings = await get_text_embeddings_batch(chunk_texts)
-#         # Convert to tensor for similarity computation
-#         chunk_embeddings_tensor = torch.stack(chunk_embeddings)
-#         # Compute similarities with query embedding
-#         similarities = compute_similarity(query_embedding, chunk_embeddings_tensor)
-#         # Find the chunk with highest similarity
-#         best_idx = torch.argmax(similarities).item()
-        
-#         return chunks[best_idx]
-        
-#     except Exception as e:
-#         logger.error(f"Error generating preview: {e}")
-#         # Fallback: return first preview_char characters
-#         return passage_text[:preview_char]
-
-
 async def generate_preview(passage_text: str, paper_title: str, query: str, preview_char: int) -> str:
     """Generate a preview of the most relevant chunk from a passage"""
     if preview_char <= 0:
@@ -757,122 +653,128 @@ def softmax(x, temp=1.0):
     return exp_x / np.sum(exp_x)
 
 
+# Token patterns for yes/no classification in reranking
+YES_TOKENS = ["yes", "Yes", "YES", " yes", " Yes", " YES", "▁yes", "▁Yes"]
+NO_TOKENS = ["no", "No", "NO", " no", " No", " NO", "▁no", "▁No"]
+
+
+def _prepare_rerank_texts(query: str, results: List[tuple]) -> List[str]:
+    """Prepare formatted texts for reranking."""
+    instruction = "Given a web search query, retrieve relevant passages that answer the query"
+    rerank_texts = []
+    for idx, (passage_id, score) in enumerate(results):
+        doc_text = get_passage_text(passage_id)
+        formatted_text = format_instruction(instruction, query, doc_text)
+        rerank_texts.append(formatted_text)
+        if DEBUG_MODE and idx == 0:
+            logger.info(f"DEBUG: Sample reranker input length: {len(formatted_text)} chars")
+    return rerank_texts
+
+
+def _extract_score_from_logprobs(logprobs_data: dict, debug_idx: int = -1) -> float:
+    """Extract relevance score from logprobs by computing P(yes) using softmax."""
+    if not logprobs_data or not logprobs_data.get("top_logprobs"):
+        if DEBUG_MODE and debug_idx >= 0 and debug_idx < 3:
+            logger.info(f"  No logprobs in response, using default score: 0.5")
+        return 0.5
+
+    top_logprobs = logprobs_data["top_logprobs"]
+    if len(top_logprobs) == 0:
+        if DEBUG_MODE and debug_idx >= 0 and debug_idx < 3:
+            logger.info(f"  No logprobs found for first token, using default score: 0.5")
+        return 0.5
+
+    first_token_logprobs = top_logprobs[0]
+
+    # Log top 5 logprobs in debug mode
+    if DEBUG_MODE and debug_idx >= 0 and debug_idx < 3:
+        sorted_logprobs = sorted(first_token_logprobs.items(), key=lambda x: x[1], reverse=True)[:5]
+        logger.info(f"  Top 5 logprobs:")
+        for token, logprob in sorted_logprobs:
+            logger.info(f"    Token: '{token}' -> Logprob: {logprob:.4f}")
+
+    # Find yes/no logprobs
+    yes_logprob = -np.inf
+    no_logprob = -np.inf
+    for token, logprob in first_token_logprobs.items():
+        if token in YES_TOKENS:
+            yes_logprob = max(yes_logprob, logprob)
+        elif token in NO_TOKENS:
+            no_logprob = max(no_logprob, logprob)
+
+    # Apply softmax to get probabilities
+    probabilities = softmax([yes_logprob, no_logprob])
+    score = probabilities[0]  # Probability of "yes"
+
+    if DEBUG_MODE and debug_idx >= 0 and debug_idx < 3:
+        logger.info(f"  Yes logprob: {yes_logprob:.4f}")
+        logger.info(f"  No logprob: {no_logprob:.4f}")
+        logger.info(f"  Final score (P(yes)): {score:.4f}")
+
+    return score
+
+
 async def rerank_results(query: str, results: List[tuple], top_k: int = None) -> List[tuple]:
-    """Rerank search results using the reranker server"""
+    """Rerank search results using the reranker server."""
     rerank_start_time = time.time()
-    
+
     if top_k is None:
         top_k = config.TOP_K_RERANK
-    
+
     if DEBUG_MODE:
         logger.info(f"DEBUG: Starting reranking for {len(results)} results, selecting top {top_k}")
+
     try:
         # Prepare input for reranker
         prep_start_time = time.time()
-        rerank_texts = []
-        for idx, (passage_id, score) in enumerate(results):
-            # Create query-document pairs for reranking
-            instruction = "Given a web search query, retrieve relevant passages that answer the query"
-            doc_text = get_passage_text(passage_id)
-            # Format the instruction text
-            formatted_text = format_instruction(instruction, query, doc_text)
-            rerank_texts.append(formatted_text)
-            if DEBUG_MODE and idx == 0:
-                logger.info(f"DEBUG: Sample reranker input length: {len(formatted_text)} chars")
-        
+        rerank_texts = _prepare_rerank_texts(query, results)
+
         if DEBUG_MODE:
             logger.info(f"DEBUG: Prepared {len(rerank_texts)} inputs for reranking in {time.time() - prep_start_time:.3f} seconds")
 
         # Send request to VLLM's OpenAI-compatible completions endpoint for scoring
         url = f"http://{config.RERANKER_SERVER_HOST}:{config.RERANKER_SERVER_PORT}/v1/completions"
-        
-        # Process each text for reranking using VLLM's scoring capability
+
         rerank_scores = []
         generate_start_time = time.time()
-        
+
         # Batch process for efficiency
         batch_size = config.RERANK_BATCH_SIZE
         async with httpx.AsyncClient() as client:
             for i in range(0, len(rerank_texts), batch_size):
                 batch_texts = rerank_texts[i:i+batch_size]
-                
-                # Use VLLM's completions endpoint with logprobs to get scores
+
                 payload = {
                     "model": "reranker-model",
                     "prompt": batch_texts,
                     "max_tokens": 1,
-                    "logprobs": config.RERANK_MAX_LOGPROBS,  # Request many logprobs to find yes/no tokens
+                    "logprobs": config.RERANK_MAX_LOGPROBS,
                     "temperature": 0.6
                 }
-                
+
                 response = await client.post(url, json=payload, timeout=60)
                 response.raise_for_status()
                 result = response.json()
-                
+
                 # Extract scores from logprobs for yes/no tokens
                 for idx, choice in enumerate(result["choices"]):
-                    if DEBUG_MODE and i + idx < 3:  # Log first 3 examples
-                        logger.info(f"\nDEBUG: Reranking example {i + idx + 1}:")
+                    debug_idx = i + idx
+                    if DEBUG_MODE and debug_idx < 3:
+                        logger.info(f"\nDEBUG: Reranking example {debug_idx + 1}:")
                         logger.info(f"  Input prompt (first 200 chars): {batch_texts[idx][:200]}...")
-                    
-                    if choice.get("logprobs") and choice["logprobs"].get("top_logprobs"):
-                        # Get the first token's top logprobs
-                        if len(choice["logprobs"]["top_logprobs"]) > 0:
-                            first_token_logprobs = choice["logprobs"]["top_logprobs"][0]
-                            
-                            # Log top 5 logprobs in debug mode
-                            if DEBUG_MODE and i + idx < 3:
-                                sorted_logprobs = sorted(first_token_logprobs.items(), key=lambda x: x[1], reverse=True)[:5]
-                                logger.info(f"  Top 5 logprobs:")
-                                for token, logprob in sorted_logprobs:
-                                    logger.info(f"    Token: '{token}' -> Logprob: {logprob:.4f}")
-                            
-                            # Look for yes/no tokens - check various possible formats
-                            yes_tokens = ["yes", "Yes", "YES", " yes", " Yes", " YES", "▁yes", "▁Yes"]
-                            no_tokens = ["no", "No", "NO", " no", " No", " NO", "▁no", "▁No"]
-                            
-                            # Get token IDs if available (VLLM might provide token strings directly)
-                            yes_logprob = -np.inf
-                            no_logprob = -np.inf
-                            
-                            # Search through all available logprobs
-                            for token, logprob in first_token_logprobs.items():
-                                if token in yes_tokens:
-                                    yes_logprob = max(yes_logprob, logprob)
-                                elif token in no_tokens:
-                                    no_logprob = max(no_logprob, logprob)
-                            
-                            # Apply softmax to get probabilities
-                            logprobs = [yes_logprob, no_logprob]
-                            probabilities = softmax(logprobs)
-                            score = probabilities[0]  # Probability of "yes"
-                            
-                            # Log yes/no logprobs and final score in debug mode
-                            if DEBUG_MODE and i + idx < 3:
-                                logger.info(f"  Yes logprob: {yes_logprob:.4f}")
-                                logger.info(f"  No logprob: {no_logprob:.4f}")
-                                logger.info(f"  Final score (P(yes)): {score:.4f}")
-                        else:
-                            score = 0.5  # Default neutral score
-                            if DEBUG_MODE and i + idx < 3:
-                                logger.info(f"  No logprobs found for first token, using default score: {score}")
-                    else:
-                        score = 0.5  # Default neutral score if no logprobs
-                        if DEBUG_MODE and i + idx < 3:
-                            logger.info(f"  No logprobs in response, using default score: {score}")
+
+                    score = _extract_score_from_logprobs(choice.get("logprobs"), debug_idx)
                     rerank_scores.append(score)
-        
+
         if DEBUG_MODE:
             logger.info(f"DEBUG: Reranker server responded in {time.time() - generate_start_time:.3f} seconds")
-        
+
         # Combine results with scores
-        new_results = []
-        for (passage_id, score), rerank_score in zip(results, rerank_scores):
-            new_results.append((passage_id, rerank_score))
+        new_results = [(passage_id, rerank_score) for (passage_id, _), rerank_score in zip(results, rerank_scores)]
 
         # Sort by score and return top_k
         reranked = sorted(new_results, key=lambda x: x[1] or 0, reverse=True)
-        
+
         if DEBUG_MODE:
             logger.info(f"DEBUG: Total reranking time: {time.time() - rerank_start_time:.3f} seconds")
             logger.info(f"DEBUG: Top 3 reranked scores: {[score for _, score in reranked[:3]]}")
@@ -1106,15 +1008,10 @@ async def health_check():
         },
         "data_loaded": {
             "metadata_dataset": metadata_dataset is not None,
-            "embeddings_matrix": embeddings_matrix is not None,
-            "embeddings_shape": (
-                embeddings_matrix.shape if embeddings_matrix is not None else None
-            ),
+            "faiss_index": faiss_manager is not None,
+            "faiss_stats": faiss_manager.get_stats() if faiss_manager else None,
         },
         "cache_statistics": {
-            # "url_content_cache_size": len(url_content_cache),
-            # "total_cache_memory_mb": sum(len(content) for content in url_content_cache.values()) / (1024 * 1024) if url_content_cache else 0,
-            # "cache_initialized": bool(url_content_cache),
             "startup_cache_enabled": config.USE_STARTUP_CACHE,
             "startup_cache_stats": startup_cache.get_cache_stats() if startup_cache else None,
         },

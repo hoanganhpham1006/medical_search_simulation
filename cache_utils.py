@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 class UltraFastBinaryCache:
     def __init__(self, data_path="cache.bin", index_path="cache.idx"):
-        self.data_path = data_path
-        self.index_path = index_path
+        self.data_path = Path(data_path)
+        self.index_path = Path(index_path)
         self.index: Dict[str, Tuple[int, int]] = {}
     
     def build_cache(self, metadata_dataset, show_progress=True):
@@ -282,9 +282,8 @@ class StartupDataCache:
             logger.info("Clearing cache")
             for file_path in [
                 self.emb_id_mapping_file,
-                self.quantized_embeddings_file,
-                self.quantization_metadata_file, 
-                self.url_content_cache_db.db_path,
+                self.url_content_cache_db.data_path,
+                self.url_content_cache_db.index_path,
                 self.cache_info_file
             ]:
                 if file_path.exists():
@@ -301,13 +300,11 @@ class StartupDataCache:
             'cache_valid': self.is_cache_valid(),
             'files': {}
         }
-        
+
         for name, file_path in [
             ('emb_id_mapping', self.emb_id_mapping_file),
-            ('quantized_embeddings', self.quantized_embeddings_file),
-            ('quantization_metadata', self.quantization_metadata_file),
-            # ('url_content_cache', self.url_content_cache_file),
-            ('url_content_cache_db', self.url_content_cache_db.db_path),
+            ('url_content_cache_data', self.url_content_cache_db.data_path),
+            ('url_content_cache_index', self.url_content_cache_db.index_path),
             ('cache_info', self.cache_info_file)
         ]:
             if file_path.exists():
@@ -319,5 +316,5 @@ class StartupDataCache:
                 }
             else:
                 stats['files'][name] = {'exists': False}
-        
+
         return stats
